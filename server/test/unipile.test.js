@@ -14,6 +14,17 @@ const proxyEnvNames = [
   "ALL_PROXY", "all_proxy", "SAND_EGRESS_TUNNEL_PROXY_ADDR",
 ];
 const allProxyEnvNames = [...proxyEnvNames, "NO_PROXY", "no_proxy"];
+const rateLimitStopHint = " 停止发送。稍后再试。这可能触发了领英限制。";
+
+function assertRateReminder(reminder) {
+  assert.equal(typeof reminder, "string");
+  assert.match(reminder, /Unipile 保守建议/);
+  assert.match(reminder, /每个领英账号/);
+  assert.match(reminder, /给好友发消息每天约 100 条/);
+  assert.match(reminder, /发送间隔要随机/);
+  assert.match(reminder, /多个 bot 共用同一账号时额度共享/);
+  assert.match(reminder, /批量发送前请控制数量/);
+}
 
 function clearProxyEnv(t) {
   const previous = Object.fromEntries(allProxyEnvNames.map((name) => [name, process.env[name]]));
@@ -384,7 +395,9 @@ test("send_message without confirm or with confirm=false returns a preview witho
   const client = await connectClient(t);
   const preview = { chat_id: "chat-1", account_id: "account-1", text: "你好。\nPlease confirm." };
   for (const confirm of [undefined, false]) {
-    assert.deepEqual(await callTool(client, "send_message", { ...preview, confirm }), {
+    const { rate_reminder, ...result } = await callTool(client, "send_message", { ...preview, confirm });
+    assertRateReminder(rate_reminder);
+    assert.deepEqual(result, {
       sent: false,
       preview,
       notice: "该消息将以你本人的身份发出。确认后用 confirm=true 再次调用。",
@@ -400,7 +413,9 @@ test("send_message with confirm=true posts encoded chat_id and multipart text an
   const chat_id = "chat/a ?#% 中文";
   const text = "你好，领英。\nLinkedIn & text=保持原样";
   const account_id = "account & 中文";
-  assert.deepEqual(await callTool(client, "send_message", { chat_id, text, account_id, confirm: true }), sent);
+  const { rate_reminder, ...result } = await callTool(client, "send_message", { chat_id, text, account_id, confirm: true });
+  assertRateReminder(rate_reminder);
+  assert.deepEqual(result, sent);
   assert.equal(requests.length, 2);
   assertRequest(requests[0], `/api/v1/accounts/${encodeURIComponent(account_id)}`, {});
   const { contentType, body, ...request } = requests[1];
@@ -465,6 +480,7 @@ test("start_chat_by_profile previews without confirm or with confirm=false witho
     assert.match(result.notice, /非好友可能发不出去/);
     assert.match(result.notice, /本工具不做 InMail/);
     assert.match(result.notice, /confirm=true/);
+    assertRateReminder(result.rate_reminder);
   }
   assert.equal(requests.length, 0);
 });
@@ -477,9 +493,11 @@ test("start_chat_by_profile confirms account, retrieves provider_id, then posts 
   const client = await connectClient(t);
   const account_id = "account & 中文";
   const text = "你好，领英。\nLinkedIn & text=保持原样";
-  assert.deepEqual(await callTool(client, "start_chat_by_profile", {
+  const { rate_reminder, ...result } = await callTool(client, "start_chat_by_profile", {
     profile: "https://linkedin.com/in/%E6%9D%8E%E6%98%8E-123/", text, account_id, confirm: true,
-  }), sent);
+  });
+  assertRateReminder(rate_reminder);
+  assert.deepEqual(result, sent);
   assert.equal(requests.length, 3);
   assertRequest(requests[0], `/api/v1/accounts/${encodeURIComponent(account_id)}`, {});
   assertRequest(requests[1], `/api/v1/users/${encodeURIComponent("李明-123")}`, { account_id });
@@ -492,6 +510,35 @@ test("start_chat_by_profile confirms account, retrieves provider_id, then posts 
   assert.deepEqual([...form.entries()], [
     ["attendees_ids", provider_id], ["text", text.replace(/\r?\n/g, "\r\n")], ["account_id", account_id],
   ]);
+});
+
+test("发送工具的预览和并发成功结果共享频率提醒。API 字段保留。", async (t) => {
+  const apiResponse = { object: "MessageSent", message_id: "message-1", extra: { value: "保留" } };
+  const requests = await mockApi(t, ({ path }) => path.startsWith("/api/v1/users/")
+    ? { provider_id: "recipient-provider-id" } : apiResponse);
+  const client = await connectClient(t);
+  const tools = [
+    ["send_message", { chat_id: "chat-1" }],
+    ["start_chat_by_profile", { profile: "recipient-1" }],
+  ];
+  const args = { account_id: "shared-account", text: "你好" };
+  const previews = await Promise.all(tools.map(([name, input]) => callTool(client, name, { ...args, ...input })));
+  assert.equal(requests.length, 0);
+  const sent = await Promise.all(tools.map(([name, input]) => callTool(client, name, { ...args, ...input, confirm: true })));
+  assert.equal(requests.length, 5);
+  assert.equal(requests.filter(({ method }) => method === "POST").length, 2);
+  for (const result of [...previews, ...sent]) {
+    assertRateReminder(result.rate_reminder);
+    assert.equal(result.rate_reminder, previews[0].rate_reminder);
+  }
+  for (const { rate_reminder, ...result } of sent) assert.deepEqual(result, apiResponse);
+  const { tools: listed } = await client.listTools();
+  for (const [name] of tools) {
+    const { description } = listed.find((tool) => tool.name === name);
+    assert.match(description, /批量发送前先提醒用户 Unipile 领英频率保守建议/);
+    assert.match(description, /好友消息每天约 100 条/);
+    assert.match(description, /多 bot 共用账号额度共享/);
+  }
 });
 
 test("start_chat_by_profile rejects invalid input before requests", async (t) => {
@@ -915,13 +962,38 @@ test("HTTP errors include status and a redacted response limited to 500 characte
   await assert.rejects(unipileRequest("/accounts"), (error) => {
     const prefix = "Unipile HTTP 429: ";
     assert.ok(error.message.startsWith(prefix));
-    const body = error.message.slice(prefix.length);
+    assert.ok(error.message.endsWith(rateLimitStopHint));
+    const body = error.message.slice(prefix.length, -rateLimitStopHint.length);
     assert.equal(body.length, 500);
     assert.ok(body.startsWith("Denied [REDACTED] "));
     assert.equal(body.includes("test-key"), false);
     assert.equal(body.includes("END"), false);
     return true;
   });
+});
+
+test("429 和 500 附加停止提示。422 仅在正文含 cannot_resend_yet 时附加。", async (t) => {
+  let response;
+  await mockApi(t, () => response);
+  for (const [status, body, stop] of [
+    [429, "Denied test-key", true],
+    [500, "Failed test-key", true],
+    [422, '{"type":"cannot_resend_yet","key":"test-key"}', true],
+    [422, "Cannot_Resend_Yet test-key", true],
+    [422, `${"x".repeat(600)} CANNOT_RESEND_YET test-key`, true],
+    [422, "Invalid input test-key", false],
+    [400, "cannot_resend_yet test-key", false],
+    [401, "Unauthorized test-key", false],
+  ]) {
+    response = { status, body };
+    await assert.rejects(unipileRequest("/accounts"), (error) => {
+      const redactedBody = body.replaceAll("test-key", "[REDACTED]").slice(0, 500);
+      assert.equal(error.message, `Unipile HTTP ${status}: ${redactedBody}${stop ? rateLimitStopHint : ""}`);
+      assert.equal(error.message.includes("test-key"), false);
+      assert.equal(error.message.includes("停止发送"), stop);
+      return true;
+    });
+  }
 });
 
 test("all handlers return isError and continue to handle later requests", async (t) => {
@@ -939,7 +1011,7 @@ test("all handlers return isError and continue to handle later requests", async 
   ]) {
     const result = await client.callTool({ name, arguments: args });
     assert.deepEqual(result, {
-      content: [{ type: "text", text: "Error: Unipile HTTP 500: Failed [REDACTED]" }],
+      content: [{ type: "text", text: `Error: Unipile HTTP 500: Failed [REDACTED]${rateLimitStopHint}` }],
       isError: true,
     });
   }

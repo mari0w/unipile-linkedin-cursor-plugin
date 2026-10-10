@@ -8,6 +8,7 @@ import { z } from "zod";
 
 const MAX_LINKEDIN_ACCOUNTS = 10;
 const RATE_REMINDER = "提醒：按 Unipile 保守建议，每个领英账号给好友发消息每天约 100 条以内。发送间隔要随机。多个 bot 共用同一账号时额度共享。批量发送前请控制数量。";
+const POST_RATE_REMINDER = "提醒：按 Unipile 保守建议，每个领英账号每天这类发帖操作建议不超过 100 次。发送间隔要随机。多个 bot 共用同一账号时额度共享。";
 let cachedProxyUrl = null;
 let proxyDispatcher = null;
 
@@ -337,6 +338,55 @@ export function createServer() {
         body.set("account_id", account_id);
         const apiResponse = await unipileRequest("/chats", { method: "POST", body });
         return textResult({ ...apiResponse, rate_reminder: RATE_REMINDER });
+      } catch (error) {
+        return errorResult(error);
+      }
+    }
+  );
+
+  server.tool(
+    "create_post",
+    "只支持领英账号。不支持其他平台。发布领英动态。account_id 必填，来自 list_accounts。动态以你本人的领英账号发出。提供 as_organization 时，以所选公司主页发出。默认只返回预览。预览不发送任何请求。先向用户展示账号和动态全文。用户明确确认后才传 confirm=true。confirm=true 时先查询账号类型，再用 POST 发布。text 必填。空字符串只用于 repost 指定的无评论转发。提及时，在 text 中用 {{0}} 等索引对应 mentions 数组。本版不支持附件。按 Unipile 保守建议，每个账号每天发帖建议不超过约 100 次。发送间隔要随机。多个 bot 共用同一账号时额度共享。",
+    {
+      account_id: accountId,
+      text: z.string().describe("动态全文。空字符串只用于无评论转发，此时须提供 repost。"),
+      confirm: z.boolean().default(false),
+      mentions: z.array(z.object({
+        name: z.string().min(1),
+        profile_id: z.string().min(1),
+        is_company: z.boolean().optional(),
+      })).optional(),
+      external_link: z.string().regex(/^https?:\/\//).optional(),
+      repost: z.string().min(1).optional(),
+      as_organization: z.string().min(1).optional(),
+    },
+    async ({ account_id, text, confirm, ...options }) => {
+      try {
+        if (text === "" && !options.repost) {
+          throw new Error("空 text 只用于无评论转发。请提供 repost，或填写 text。");
+        }
+        if (confirm !== true) {
+          let notice = "该动态将以你本人（或所选公司主页）的领英身份发出。确认后用 confirm=true 再次调用。";
+          if (options.external_link && !text.includes(options.external_link)) {
+            notice += "若正文未包含 external_link，Unipile 会把该链接自动加到正文末尾。";
+          }
+          return textResult({
+            sent: false,
+            preview: { account_id, text, ...options },
+            notice,
+            rate_reminder: POST_RATE_REMINDER,
+          });
+        }
+        await requireLinkedin(account_id);
+        const body = new FormData();
+        body.set("account_id", account_id);
+        body.set("text", text);
+        if (options.mentions !== undefined) body.append("mentions", JSON.stringify(options.mentions));
+        for (const name of ["external_link", "repost", "as_organization"]) {
+          if (options[name]) body.set(name, options[name]);
+        }
+        const result = await unipileRequest("/posts", { method: "POST", body });
+        return textResult({ ...result, rate_reminder: POST_RATE_REMINDER });
       } catch (error) {
         return errorResult(error);
       }

@@ -5,6 +5,7 @@ description: >-
   不支持其他平台。
   通过 Unipile 读取多个领英账号的消息。
   用于汇总消息、收集需求和搜索正文。
+  可用领英个人主页链接发起新对话。
   优先使用 unipile-linkedin MCP 工具。
   发送前必须获得用户确认。
   支持生成临时账号接入链接。
@@ -29,7 +30,7 @@ description: >-
 一个 API Key 可接入多个领英账号。
 本插件最多接入 10 个领英账号。
 `list_accounts` 只返回本页的领英账号。
-读取、搜索和发送消息时必须指定 `account_id`。
+读取、搜索、发送和按主页开聊时必须指定 `account_id`。
 `account_id` 来自 `list_accounts`。
 向 `list_accounts` 传入 `account_id` 时，只筛选本页结果。
 读取对话、读取消息和搜索消息前，工具先查询账号类型。
@@ -66,6 +67,13 @@ description: >-
 
 ## 发送规则
 
+已有对话时，使用 `send_message`。
+只有领英个人主页或公开 ID、没有 `chat_id` 时，使用 `start_chat_by_profile`。
+两种工具都默认只返回预览。
+用户明确确认后，才传 `confirm=true`。
+
+### 已有对话：`send_message`
+
 1. 先不带 `confirm` 调用 `send_message` 获取预览。
 2. 调用时传入 `chat_id`、`account_id` 和非空的 `text`。
 3. 把收件对话展示给用户。
@@ -75,11 +83,23 @@ description: >-
 7. 说明对方会看到消息。
 8. 用户明确同意后，才用同一参数和 `confirm=true` 发送。
 
+### 按主页开聊：`start_chat_by_profile`
+
+1. 先不带 `confirm` 调用 `start_chat_by_profile` 获取预览。
+2. 调用时传入领英个人主页链接或公开 ID、`account_id` 和非空的 `text`。
+3. 把解析出的公开 ID 展示给用户。
+4. 把发送账号展示给用户。
+5. 把消息全文展示给用户。
+6. 说明消息会以用户本人的领英账号发出。
+7. 说明非 Connections（非好友）可能发不出去。
+8. 说明本工具不做 InMail。
+9. 用户明确同意后，才用同一参数和 `confirm=true` 发送。
+10. `confirm=true` 时，工具先校验账号类型，再查询收件人 `provider_id`，最后创建对话并发送文本。
+
 默认调用不会发送任何请求。
 `confirm=false` 时不会发送任何请求。
 预览不发送账号查询请求。
 `confirm=true` 时，工具先查询账号类型。
-只能在已有对话里发送文本消息。
 不要批量发送。
 不要替用户自动回复。
 控制领英发送频率。
@@ -112,6 +132,8 @@ description: >-
 工具原样传递 `name`。
 链接是临时的。
 链接只给本人。
+返回的 `url` 是可直接在浏览器打开的领英登录链接。
+把返回的 `url` 作为可点击链接发给用户。
 让本人在浏览器打开链接完成登录。
 链接不要公开分享。
 所有链接在 Unipile 每日重启时失效。

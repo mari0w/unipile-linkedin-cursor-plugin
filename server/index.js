@@ -7,6 +7,7 @@ import { ProxyAgent } from "undici";
 import { z } from "zod";
 
 const MAX_LINKEDIN_ACCOUNTS = 10;
+const RATE_REMINDER = "提醒：按 Unipile 保守建议，每个领英账号给好友发消息每天约 100 条以内。发送间隔要随机。多个 bot 共用同一账号时额度共享。批量发送前请控制数量。";
 let cachedProxyUrl = null;
 let proxyDispatcher = null;
 
@@ -60,6 +61,13 @@ function errorMessage(error, apiKey = process.env.UNIPILE_API_KEY?.trim()) {
   return apiKey ? message.split(apiKey).join("[REDACTED]") : message;
 }
 
+function rateLimitHint(status, bodyText) {
+  if (status === 429 || status === 500 || (status === 422 && /cannot_resend_yet/i.test(bodyText))) {
+    return " 停止发送。稍后再试。这可能触发了领英限制。";
+  }
+  return "";
+}
+
 export async function unipileRequest(path, { method = "GET", query = {}, body } = {}) {
   const apiKey = process.env.UNIPILE_API_KEY?.trim();
   const dsn = process.env.UNIPILE_DSN;
@@ -90,8 +98,9 @@ export async function unipileRequest(path, { method = "GET", query = {}, body } 
       ...(dispatcher ? { dispatcher } : {}),
     });
     if (!response.ok) {
-      const body = errorMessage(await response.text(), apiKey).slice(0, 500);
-      throw new Error(`Unipile HTTP ${response.status}: ${body}`);
+      const bodyText = await response.text();
+      const body = errorMessage(bodyText, apiKey).slice(0, 500);
+      throw new Error(`Unipile HTTP ${response.status}: ${body}${rateLimitHint(response.status, bodyText)}`);
     }
     return await response.json();
   } catch (error) {
@@ -255,7 +264,7 @@ export function createServer() {
 
   server.tool(
     "send_message",
-    "只支持领英账号。不支持其他平台。在已有对话中发送文本消息。account_id 必填，来自 list_accounts。消息会以你本人的领英账号发出。对方会看到消息。默认只返回预览。预览不发送任何请求。发送前必须向用户展示收件对话和消息全文。用户明确确认后才传 confirm=true。confirm=true 时先查询账号类型，再发送消息。",
+    "只支持领英账号。不支持其他平台。在已有对话中发送文本消息。account_id 必填，来自 list_accounts。消息会以你本人的领英账号发出。对方会看到消息。默认只返回预览。预览不发送任何请求。发送前必须向用户展示收件对话和消息全文。用户明确确认后才传 confirm=true。confirm=true 时先查询账号类型，再发送消息。批量发送前先提醒用户 Unipile 领英频率保守建议（好友消息每天约 100 条）。多 bot 共用账号额度共享。",
     {
       chat_id: z.string().min(1),
       text: z.string().min(1),
@@ -269,15 +278,17 @@ export function createServer() {
             sent: false,
             preview: { chat_id, account_id, text },
             notice: "该消息将以你本人的身份发出。确认后用 confirm=true 再次调用。",
+            rate_reminder: RATE_REMINDER,
           });
         }
         await requireLinkedin(account_id);
         const body = new FormData();
         body.set("text", text);
         body.set("account_id", account_id);
-        return textResult(await unipileRequest(`/chats/${encodeURIComponent(chat_id)}/messages`, {
+        const apiResponse = await unipileRequest(`/chats/${encodeURIComponent(chat_id)}/messages`, {
           method: "POST", body,
-        }));
+        });
+        return textResult({ ...apiResponse, rate_reminder: RATE_REMINDER });
       } catch (error) {
         return errorResult(error);
       }
@@ -286,7 +297,7 @@ export function createServer() {
 
   server.tool(
     "start_chat_by_profile",
-    "只支持领英账号。不支持其他平台。用个人主页链接或公开 ID（slug）发起对话并发送文本。account_id 必填，来自 list_accounts。消息以用户本人领英身份发出。非 Connections（非好友）可能失败。本工具不做 InMail。默认只返回预览。预览不发送任何请求。发送前必须向用户展示收件人的公开 ID、所选账号和消息全文。用户明确确认后才传 confirm=true。只有 confirm=true 才请求。先查询账号类型，再查询收件人的 provider_id，最后创建对话并发送消息。",
+    "只支持领英账号。不支持其他平台。用个人主页链接或公开 ID（slug）发起对话并发送文本。account_id 必填，来自 list_accounts。消息以用户本人领英身份发出。非 Connections（非好友）可能失败。本工具不做 InMail。默认只返回预览。预览不发送任何请求。发送前必须向用户展示收件人的公开 ID、所选账号和消息全文。用户明确确认后才传 confirm=true。只有 confirm=true 才请求。先查询账号类型，再查询收件人的 provider_id，最后创建对话并发送消息。批量发送前先提醒用户 Unipile 领英频率保守建议（好友消息每天约 100 条）。多 bot 共用账号额度共享。",
     {
       profile: z.string().min(1),
       text: z.string().min(1),
@@ -301,6 +312,7 @@ export function createServer() {
             sent: false,
             preview: { public_id, account_id, text },
             notice: "消息将以你本人的领英身份发出。非好友可能发不出去。本工具不做 InMail。确认后用 confirm=true 再次调用。",
+            rate_reminder: RATE_REMINDER,
           });
         }
         await requireLinkedin(account_id);
@@ -312,7 +324,8 @@ export function createServer() {
         body.set("attendees_ids", user.provider_id);
         body.set("text", text);
         body.set("account_id", account_id);
-        return textResult(await unipileRequest("/chats", { method: "POST", body }));
+        const apiResponse = await unipileRequest("/chats", { method: "POST", body });
+        return textResult({ ...apiResponse, rate_reminder: RATE_REMINDER });
       } catch (error) {
         return errorResult(error);
       }

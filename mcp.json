@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "unipile-linkedin": {
+      "command": "bash",
+      "args": ["${CURSOR_PLUGIN_ROOT}/scripts/run-mcp.sh"],
+      "env": {
+        "UNIPILE_API_KEY": "${UNIPILE_API_KEY}",
+        "UNIPILE_DSN": "${UNIPILE_DSN}"
+      }
+    }
+  }
+}

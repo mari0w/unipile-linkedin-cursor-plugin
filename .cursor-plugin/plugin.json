@@ -1,0 +1,31 @@
+{
+  "name": "unipile-linkedin",
+  "displayName": "Unipile LinkedIn",
+  "version": "1.0.0",
+  "description": "只支持领英账号。不支持其他平台。通过 Unipile 读取和搜索领英消息。发送前需用户确认。最多接入 10 个领英账号。支持生成临时账号接入链接。",
+  "author": {
+    "name": "Enoch Z",
+    "email": "enochzzg@gmail.com"
+  },
+  "license": "MIT",
+  "keywords": ["unipile", "linkedin", "messages", "mcp", "accounts", "hosted-auth"],
+  "logo": "assets/logo.svg",
+  "homepage": "https://github.com/mari0w/unipile-linkedin-cursor-plugin",
+  "repository": "https://github.com/mari0w/unipile-linkedin-cursor-plugin",
+  "variables": {
+    "type": "object",
+    "properties": {
+      "UNIPILE_API_KEY": {
+        "type": "string",
+        "title": "Unipile API Key",
+        "description": "Access Token from the Unipile dashboard"
+      },
+      "UNIPILE_DSN": {
+        "type": "string",
+        "title": "Unipile DSN",
+        "description": "DSN from the Unipile dashboard, e.g. https://api1.unipile.com:13111"
+      }
+    },
+    "required": ["UNIPILE_API_KEY", "UNIPILE_DSN"]
+  }
+}

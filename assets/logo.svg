@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Unipile">
+  <rect width="128" height="128" rx="28" fill="#142A38"/>
+  <path d="M24 29h54a12 12 0 0 1 12 12v26a12 12 0 0 1-12 12H45L27 94V79h-3a12 12 0 0 1-12-12V41a12 12 0 0 1 12-12Z" fill="#46D4B3"/>
+  <path d="M55 51h49a12 12 0 0 1 12 12v25a12 12 0 0 1-12 12h-3v15L83 100H55a12 12 0 0 1-12-12V63a12 12 0 0 1 12-12Z" fill="#73B7FF"/>
+  <path d="M64 65v12a15 15 0 0 0 30 0V65" fill="none" stroke="#142A38" stroke-width="7" stroke-linecap="round"/>
+</svg>

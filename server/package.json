@@ -1,0 +1,19 @@
+{
+  "name": "unipile-linkedin-mcp-server",
+  "version": "1.0.0",
+  "description": "Unipile MCP server for LinkedIn accounts, messages, confirmed sending, and hosted authentication",
+  "main": "./index.js",
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
+  "author": "Enoch Z",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "zod": "^4.6.5"
+  }
+}

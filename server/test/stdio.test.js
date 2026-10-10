@@ -5,7 +5,7 @@ import { createInterface } from "node:readline";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-test("stdio initialize and tools/list expose exactly six tools", { timeout: 10000 }, async (t) => {
+test("stdio initialize and tools/list expose exactly seven tools", { timeout: 10000 }, async (t) => {
   const child = spawn(process.execPath, [fileURLToPath(new URL("../index.js", import.meta.url))], {
     env: { ...process.env, UNIPILE_API_KEY: "", UNIPILE_DSN: "" },
     stdio: ["pipe", "pipe", "pipe"],
@@ -45,14 +45,14 @@ test("stdio initialize and tools/list expose exactly six tools", { timeout: 1000
   const listed = await receive();
   assert.equal(listed.id, 2);
   assert.deepEqual(listed.result.tools.map((tool) => tool.name).sort(), [
-    "create_hosted_auth_link", "get_chat_messages", "list_accounts", "list_chats", "search_messages", "send_message",
+    "create_hosted_auth_link", "get_chat_messages", "list_accounts", "list_chats", "search_messages", "send_message", "start_chat_by_profile",
   ]);
-  assert.equal(listed.result.tools.length, 6);
+  assert.equal(listed.result.tools.length, 7);
   for (const tool of listed.result.tools) {
     assert.match(tool.description, /只支持领英账号/);
     assert.match(tool.description, /不支持其他平台/);
   }
-  for (const name of ["list_chats", "get_chat_messages", "search_messages", "send_message"]) {
+  for (const name of ["list_chats", "get_chat_messages", "search_messages", "send_message", "start_chat_by_profile"]) {
     const tool = listed.result.tools.find((tool) => tool.name === name);
     assert.ok(tool.inputSchema.required.includes("account_id"));
     assert.match(tool.description, /list_accounts/);
@@ -60,6 +60,11 @@ test("stdio initialize and tools/list expose exactly six tools", { timeout: 1000
   const hosted = listed.result.tools.find((tool) => tool.name === "create_hosted_auth_link");
   assert.equal(hosted.inputSchema.properties.providers, undefined);
   assert.match(hosted.description, /最多接入 10 个领英账号/);
+  assert.match(hosted.description, /把返回的 url 作为可点击链接发给用户/);
+  const startChat = listed.result.tools.find((tool) => tool.name === "start_chat_by_profile");
+  assert.equal(startChat.inputSchema.properties.confirm.default, false);
+  assert.ok(startChat.inputSchema.required.includes("profile"));
+  assert.ok(startChat.inputSchema.required.includes("text"));
   const chats = listed.result.tools.find((tool) => tool.name === "list_chats");
   assert.equal(chats.inputSchema.properties.account_type, undefined);
   assert.equal(hosted.inputSchema.properties.expires_in_minutes.default, 60);
@@ -70,6 +75,6 @@ test("stdio initialize and tools/list expose exactly six tools", { timeout: 1000
   assert.equal(failed.result.isError, true);
   assert.match(failed.result.content[0].text, /^Error: Missing UNIPILE_API_KEY \/ UNIPILE_DSN\./);
   send({ id: 4, method: "tools/list", params: {} });
-  assert.equal((await receive()).result.tools.length, 6);
+  assert.equal((await receive()).result.tools.length, 7);
   assert.equal(stderr, "");
 });

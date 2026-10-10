@@ -6,7 +6,7 @@
 本插件只支持领英账号。
 本插件不支持 Telegram 或其他平台。
 本插件最多接入 10 个领英账号。
-本插件以读取为主，另有一个发送工具。
+本插件以读取为主，另有两个发送工具。
 你可以用它汇总消息。
 你也可以用它收集需求。
 你也可以用它生成账号接入链接。
@@ -21,6 +21,7 @@
 | `get_chat_messages` | 读取领英对话消息，校验消息归属，支持发送者和时间筛选 | `GET /api/v1/chats/{chat_id}/messages` |
 | `search_messages` | 分页读取领英消息，在本地匹配正文关键字 | 有 `chat_id` 时使用 `GET /api/v1/chats/{chat_id}/messages`；否则使用 `GET /api/v1/messages` |
 | `send_message` | 默认返回预览，用户确认后发送领英文本消息 | `POST /api/v1/chats/{chat_id}/messages` |
+| `start_chat_by_profile` | 用个人主页链接或公开 ID 发起对话。默认只预览。确认后发送。不做 InMail | `GET /api/v1/users/{identifier}`，再用 `POST /api/v1/chats` |
 | `create_hosted_auth_link` | 生成领英账号接入或重连链接，新建受 10 个账号上限限制 | `POST /api/v1/hosted/accounts/link` |
 
 所有工具只支持领英账号。
@@ -96,13 +97,36 @@ Unipile 用它阻止在其他账号的对话中发送。
 预览不发送账号查询请求。
 `confirm=true` 时，工具先查询账号类型。
 只有领英账号可以发送消息。
-只能在已有对话里发送。
+`send_message` 只能在已有对话里发送。
 本版只支持文本消息。
 本版不支持附件或语音。
 不要批量发送。
 不要替用户自动回复。
 领英发送也受频率限制。
 自动化发送可能触发账号限制。
+
+## 用个人主页链接发起对话
+
+用 `start_chat_by_profile` 向一个领英用户发送文本。
+`profile`、`text` 和 `account_id` 必填。
+`profile` 可用个人主页链接，例如 `https://www.linkedin.com/in/alice-smith-123/`。
+链接可省略 `https://` 或 `www.`。
+链接可带末尾的 `/` 和查询参数。
+也可只传公开 ID，例如 `alice-smith-123`。
+无效输入会返回错误。
+`confirm` 默认为 `false`。
+默认只返回预览，不发送任何 Unipile 请求。
+预览包含解析后的公开 ID（`public_id`）、`account_id` 和消息全文。
+消息以你本人的领英身份发出。
+非好友（非 Connections）可能发不出去。
+本工具不做 InMail。
+助手先向你展示预览。
+你明确确认后，助手才传入 `confirm=true`。
+工具先查询账号类型。
+工具再用公开 ID 和 `account_id` 查询收件人的 `provider_id`。
+工具最后用表单发送 `attendees_ids`、`text` 和 `account_id`。
+工具不设置 `linkedin[inmail]`。
+参见 [创建对话接口](https://developer.unipile.com/reference/chatscontroller_startnewchat)。
 
 ## 前提
 
@@ -135,6 +159,8 @@ DSN 未包含 `http://` 或 `https://` 时，插件自动补上 `https://`。
 ### 方法二：托管认证（Hosted Auth）
 
 用 `create_hosted_auth_link` 生成临时链接。
+返回的 `url` 是可直接在浏览器打开的领英登录链接。
+助手把返回的 `url` 作为可点击链接发给你。
 接入新账号时，不需要传入参数。
 例如：`{}`。
 工具使用 `type: "create"`。
@@ -200,7 +226,8 @@ bash scripts/run-mcp.sh
 ```
 
 手动启动时，请在仓库根目录运行脚本。
-首次启动 `run-mcp.sh` 会自动运行 `npm install`。
+启动时，`run-mcp.sh` 检查 SDK、undici 和 zod。
+缺少任一直接依赖时，脚本自动运行 `npm install`。
 脚本通过 stdio 提供 MCP 服务。
 MCP 客户端需要继承这两个环境变量。
 
@@ -215,6 +242,17 @@ MCP 服务进程需要继承代理环境变量。
 前三个变量也支持小写名称。
 同一变量优先使用大写名称。
 未设置代理地址时，插件使用直连。
+`NO_PROXY` 可指定直连的目标主机。
+也可使用小写变量 `no_proxy`。
+优先使用非空的大写值。
+用逗号分隔多项规则。
+规则支持主机名、域名后缀（例如 `.unipile.com`）和 `*`。
+主机名规则也匹配其子域名。
+`*` 表示所有目标都使用直连。
+主机名可带端口，例如 `api1.unipile.com:13111`。
+带端口的规则只匹配该端口。
+规则不区分大小写。
+命中规则时，插件不使用代理。
 
 ## 使用示例提问
 
@@ -225,6 +263,7 @@ MCP 服务进程需要继承代理环境变量。
 - “在这个对话的最近 300 条消息中搜索 budget。”
 - “生成一个领英账号接入链接。”
 - “预览在这个对话中发送的消息：我已收到你的需求。”
+- “预览向 https://www.linkedin.com/in/alice-smith-123/ 发送：你好，我想讨论你的需求。”
 
 ## 领英账号风险提示
 
@@ -263,7 +302,7 @@ cd server && npm test
 测试使用本地 HTTP 服务。
 测试不调用真实的 Unipile 账号。
 stdio 测试会发送 `initialize` 和 `tools/list`。
-测试会确认服务正好提供六个工具。
+测试会确认服务正好提供七个工具。
 
 ## 许可证
 

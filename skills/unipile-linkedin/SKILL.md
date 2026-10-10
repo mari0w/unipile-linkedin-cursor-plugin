@@ -139,6 +139,21 @@ description: >-
 所有链接在 Unipile 每日重启时失效。
 完成登录后，再调用 `list_accounts` 查询账号。
 
+## DSN 和代理
+
+用户仍只需配置 DSN 和 API Key。
+DSN 可保留原端口。
+DSN 带非协议默认端口时，插件自动通过 HTTPS 443 请求。
+每个请求都带查询参数 `port=<原端口>`。
+插件保留其他查询参数。
+DSN 无端口或使用协议默认端口时，插件保留原协议。
+此时插件不额外加入 `port`。
+443 失败时，插件不回退到原端口。
+非常用端口场景优先使用插件的 443 和 `port` 方式。
+插件仍支持 `HTTPS_PROXY`、`HTTP_PROXY`、`ALL_PROXY` 和 `SAND_EGRESS_TUNNEL_PROXY_ADDR`。
+`NO_PROXY` 按实际请求地址匹配。
+改写后的实际请求端口是 443。
+
 ## 安全
 
 - 控制调用频率，保护领英账号。

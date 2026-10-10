@@ -1,10 +1,9 @@
 import assert from "node:assert/strict";
-import { createServer as createHttpServer } from "node:http";
 import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ProxyAgent } from "undici";
-import { baseUrl, createServer, getProxyDispatcher, parseLinkedinPublicId, resolveProxyUrl, searchMessages, shouldBypassProxy, unipileRequest } from "../index.js";
+import { baseUrl, buildUnipileUrl, createServer, getProxyDispatcher, parseLinkedinPublicId, resolveProxyUrl, searchMessages, shouldBypassProxy, unipileRequest } from "../index.js";
 
 const before = "2026-10-10T00:00:00Z";
 const after = "2026-10-01T00:00:00Z";
@@ -35,34 +34,35 @@ async function mockApi(t, respond = () => emptyPage, account = { type: "LINKEDIN
   const previousDsn = process.env.UNIPILE_DSN;
   const requests = [];
   let page = 0;
-  const mock = createHttpServer(async (req, res) => {
-    const url = new URL(req.url, "http://localhost");
+  t.mock.method(globalThis, "fetch", async (url, options) => {
+    // Check the transport URL for every tool and page.
+    assert.equal(url.origin, "https://api1.unipile.com");
+    assert.equal(url.port, "");
+    assert.deepEqual(url.searchParams.getAll("port"), ["13111"]);
+    const req = new Request(url, options);
     const request = {
       method: req.method,
       path: url.pathname,
       query: Object.fromEntries(url.searchParams),
-      apiKey: req.headers["x-api-key"],
-      accept: req.headers.accept,
+      apiKey: req.headers.get("x-api-key"),
+      accept: req.headers.get("accept"),
     };
-    const chunks = [];
-    for await (const chunk of req) chunks.push(chunk);
-    if (req.headers["content-type"]) request.contentType = req.headers["content-type"];
-    if (chunks.length) request.body = Buffer.concat(chunks).toString();
+    if (req.headers.has("content-type")) request.contentType = req.headers.get("content-type");
+    if (req.body) request.body = await req.text();
     requests.push(request);
     const response = request.path.startsWith("/api/v1/accounts/") ? account : respond(request, ++page);
-    res.writeHead(response.status ?? 200, { "content-type": "application/json" });
-    res.end(response.body ?? JSON.stringify(response));
+    return new Response(response.body ?? JSON.stringify(response), {
+      status: response.status ?? 200,
+      headers: { "content-type": "application/json" },
+    });
   });
-  await new Promise((resolve) => mock.listen(0, "127.0.0.1", resolve));
-  process.env.UNIPILE_DSN = `http://127.0.0.1:${mock.address().port}`;
+  process.env.UNIPILE_DSN = "https://api1.unipile.com:13111";
   process.env.UNIPILE_API_KEY = "test-key";
-  t.after(async () => {
+  t.after(() => {
     if (previousKey === undefined) delete process.env.UNIPILE_API_KEY;
     else process.env.UNIPILE_API_KEY = previousKey;
     if (previousDsn === undefined) delete process.env.UNIPILE_DSN;
     else process.env.UNIPILE_DSN = previousDsn;
-    mock.closeAllConnections();
-    await new Promise((resolve, reject) => mock.close((error) => error ? reject(error) : resolve()));
   });
   return requests;
 }
@@ -91,7 +91,7 @@ function assertRequest(request, path, query) {
   assert.deepEqual(request, {
     method: "GET",
     path,
-    query,
+    query: { ...query, port: "13111" },
     apiKey: "test-key",
     accept: "application/json",
   });
@@ -205,7 +205,7 @@ test("get_chat_messages rejects the whole page if any message has a different or
   assertRequest(requests[2], "/api/v1/accounts/account-1", {});
 });
 
-test("list and message tools omit all optional query parameters", async (t) => {
+test("list and message tools omit optional filters and keep the DSN port", async (t) => {
   const requests = await mockApi(t);
   const client = await connectClient(t);
   await callTool(client, "list_accounts");
@@ -405,7 +405,7 @@ test("send_message with confirm=true posts encoded chat_id and multipart text an
   assertRequest(requests[0], `/api/v1/accounts/${encodeURIComponent(account_id)}`, {});
   const { contentType, body, ...request } = requests[1];
   assert.deepEqual(request, {
-    method: "POST", path: `/api/v1/chats/${encodeURIComponent(chat_id)}/messages`, query: {},
+    method: "POST", path: `/api/v1/chats/${encodeURIComponent(chat_id)}/messages`, query: { port: "13111" },
     apiKey: "test-key", accept: "application/json",
   });
   assert.match(contentType, /^multipart\/form-data; boundary=.+$/);
@@ -485,7 +485,7 @@ test("start_chat_by_profile confirms account, retrieves provider_id, then posts 
   assertRequest(requests[1], `/api/v1/users/${encodeURIComponent("李明-123")}`, { account_id });
   const { contentType, body, ...request } = requests[2];
   assert.deepEqual(request, {
-    method: "POST", path: "/api/v1/chats", query: {}, apiKey: "test-key", accept: "application/json",
+    method: "POST", path: "/api/v1/chats", query: { port: "13111" }, apiKey: "test-key", accept: "application/json",
   });
   assert.match(contentType, /^multipart\/form-data; boundary=.+$/);
   const form = await new Response(body, { headers: { "content-type": contentType } }).formData();
@@ -539,7 +539,7 @@ test("create_hosted_auth_link fixes providers to LinkedIn and posts normalized a
     assertRequest(requests.at(-2), "/api/v1/accounts", { limit: "250" });
     const { contentType, body: rawBody, ...request } = requests.at(-1);
     assert.deepEqual(request, {
-      method: "POST", path: "/api/v1/hosted/accounts/link", query: {},
+      method: "POST", path: "/api/v1/hosted/accounts/link", query: { port: "13111" },
       apiKey: "test-key", accept: "application/json",
     });
     assert.equal(contentType, "application/json");
@@ -654,6 +654,52 @@ test("baseUrl adds https and removes trailing slashes and the API suffix", () =>
   assert.equal(baseUrl("https://api1.unipile.com:13111/api/v1///"), "https://api1.unipile.com:13111");
 });
 
+test("buildUnipileUrl sends nondefault DSN ports through HTTPS 443", () => {
+  for (const dsn of [
+    "https://api1.unipile.com:13111",
+    "api1.unipile.com:13111",
+    "http://api1.unipile.com:13111",
+    " https://api1.unipile.com:13111/api/v1/// ",
+  ]) {
+    assert.equal(buildUnipileUrl(dsn, "/accounts").href,
+      "https://api1.unipile.com/api/v1/accounts?port=13111", dsn);
+  }
+  assert.equal(buildUnipileUrl("http://api1.unipile.com:443", "/accounts").href,
+    "https://api1.unipile.com/api/v1/accounts?port=443");
+  assert.equal(buildUnipileUrl("https://api1.unipile.com:80", "/accounts").href,
+    "https://api1.unipile.com/api/v1/accounts?port=80");
+  assert.equal(buildUnipileUrl("http://[::1]:13111", "/accounts").href,
+    "https://[::1]/api/v1/accounts?port=13111");
+});
+
+test("buildUnipileUrl preserves the protocol without a nondefault DSN port", () => {
+  for (const [dsn, origin] of [
+    ["https://api1.unipile.com", "https://api1.unipile.com"],
+    ["api1.unipile.com", "https://api1.unipile.com"],
+    ["https://api1.unipile.com:443", "https://api1.unipile.com"],
+    ["http://api1.unipile.com", "http://api1.unipile.com"],
+    ["http://api1.unipile.com:80", "http://api1.unipile.com"],
+  ]) {
+    assert.equal(buildUnipileUrl(dsn, "/accounts").href, `${origin}/api/v1/accounts`, dsn);
+    assert.equal(buildUnipileUrl(dsn, "/accounts", { port: 1234 }).searchParams.get("port"), "1234");
+  }
+});
+
+test("buildUnipileUrl merges filters and overrides caller port without changing query", () => {
+  const query = Object.freeze({
+    cursor: "next+/=?& 中文", limit: 100, account_id: "account & 1", port: 9999, before: undefined,
+  });
+  const url = buildUnipileUrl("https://api1.unipile.com:13111", "/messages", query);
+  assert.equal(url.origin, "https://api1.unipile.com");
+  assert.equal(url.pathname, "/api/v1/messages");
+  assert.equal(url.port, "");
+  assert.deepEqual(Object.fromEntries(url.searchParams), {
+    cursor: query.cursor, limit: "100", account_id: query.account_id, port: "13111",
+  });
+  assert.deepEqual(url.searchParams.getAll("port"), ["13111"]);
+  assert.equal(query.port, 9999);
+});
+
 test("resolveProxyUrl skips blank values and selects every proxy variable in priority order", () => {
   assert.equal(resolveProxyUrl({}), null);
   assert.equal(resolveProxyUrl(Object.fromEntries(proxyEnvNames.map((name) => [name, " \t "]))), null);
@@ -698,17 +744,19 @@ test("unipileRequest bypasses ProxyAgent for matching NO_PROXY and no_proxy on e
     assert.equal(Object.hasOwn(options, "dispatcher"), false);
     return directFetch(url, options);
   });
-  process.env.NO_PROXY = "other.example, 127.0.0.1";
+  process.env.NO_PROXY = "other.example, api1.unipile.com";
   assert.deepEqual(await unipileRequest("/accounts"), emptyPage);
   process.env.NO_PROXY = " ";
-  process.env.no_proxy = "127.0.0.1";
+  process.env.no_proxy = "api1.unipile.com";
   assert.deepEqual(await unipileRequest("/accounts"), emptyPage);
   process.env.no_proxy = "*";
   assert.deepEqual(await unipileRequest("/accounts"), emptyPage);
-  assert.equal(requests.length, 3);
-  process.env.no_proxy = "other.example";
+  process.env.no_proxy = "api1.unipile.com:443";
+  assert.deepEqual(await unipileRequest("/accounts"), emptyPage);
+  assert.equal(requests.length, 4);
+  process.env.no_proxy = "api1.unipile.com:13111";
   await assert.rejects(unipileRequest("/accounts"), { message: "Invalid URL" });
-  assert.equal(requests.length, 3);
+  assert.equal(requests.length, 4);
 });
 
 test("unipileRequest uses direct fetch when no proxy is set", async (t) => {
@@ -727,16 +775,24 @@ test("unipileRequest passes a shared ProxyAgent to concurrent requests and updat
   process.env.HTTPS_PROXY = " https://proxy.example:8443 ";
   process.env.HTTP_PROXY = "http://fallback.example:8080";
   const dispatchers = [];
+  const queries = [];
   t.mock.method(globalThis, "fetch", async (url, options) => {
+    assert.equal(url.origin, "https://api1.unipile.com");
+    assert.equal(url.searchParams.get("port"), "13111");
     assert.equal(url.pathname, "/api/v1/accounts");
     assert.ok(options.dispatcher instanceof ProxyAgent);
     assert.equal(options.headers["X-API-KEY"], "test-key");
     assert.ok(options.signal instanceof AbortSignal);
     dispatchers.push(options.dispatcher);
+    queries.push(Object.fromEntries(url.searchParams));
     return Response.json(emptyPage);
   });
   assert.equal(resolveProxyUrl(), "https://proxy.example:8443");
-  assert.deepEqual(await Promise.all([unipileRequest("/accounts"), unipileRequest("/accounts")]), [emptyPage, emptyPage]);
+  assert.deepEqual(await Promise.all([
+    unipileRequest("/accounts", { query: { cursor: "first" } }),
+    unipileRequest("/accounts", { query: { cursor: "second" } }),
+  ]), [emptyPage, emptyPage]);
+  assert.deepEqual(queries, [{ cursor: "first", port: "13111" }, { cursor: "second", port: "13111" }]);
   assert.equal(dispatchers[0], dispatchers[1]);
   const oldClose = t.mock.method(dispatchers[0], "close");
   delete process.env.HTTPS_PROXY;
@@ -789,9 +845,48 @@ test("unipileRequest reads environment variables on each call", async (t) => {
   await unipileRequest("/accounts", { query: { cursor: "new-page", limit: 100 } });
   assertRequest(requests[0], "/api/v1/accounts", {});
   assert.deepEqual(requests[1], {
-    method: "GET", path: "/api/v1/accounts", query: { cursor: "new-page", limit: "100" },
+    method: "GET", path: "/api/v1/accounts", query: { cursor: "new-page", limit: "100", port: "13111" },
     apiKey: "replacement-key", accept: "application/json",
   });
+});
+
+test("unipileRequest uses the current DSN for custom and default ports", async (t) => {
+  await mockApi(t);
+  const urls = [];
+  t.mock.method(globalThis, "fetch", async (url) => {
+    urls.push(url.href);
+    return Response.json(emptyPage);
+  });
+  for (const dsn of ["api1.unipile.com:13111", "http://api2.unipile.com:80", "https://api2.unipile.com:443"]) {
+    process.env.UNIPILE_DSN = dsn;
+    await unipileRequest("/accounts");
+  }
+  assert.deepEqual(urls, [
+    "https://api1.unipile.com/api/v1/accounts?port=13111",
+    "http://api2.unipile.com/api/v1/accounts",
+    "https://api2.unipile.com/api/v1/accounts",
+  ]);
+});
+
+test("unipileRequest does not retry or fall back after a 443 failure", async (t) => {
+  const requests = await mockApi(t);
+  const successfulFetch = globalThis.fetch;
+  let failure;
+  const fetchMock = t.mock.method(globalThis, "fetch", async (url) => {
+    assert.equal(url.href, "https://api1.unipile.com/api/v1/accounts?port=13111");
+    if (failure === "network") throw new Error("443 connection failed");
+    return new Response("443 gateway failed", { status: 502 });
+  });
+  for (failure of ["network", "http"]) {
+    const calls = fetchMock.mock.callCount();
+    await assert.rejects(unipileRequest("/accounts"), {
+      message: failure === "network" ? "443 connection failed" : "Unipile HTTP 502: 443 gateway failed",
+    });
+    assert.equal(fetchMock.mock.callCount(), calls + 1);
+  }
+  fetchMock.mock.mockImplementation(successfulFetch);
+  assert.deepEqual(await unipileRequest("/accounts"), emptyPage);
+  assert.equal(requests.length, 1);
 });
 
 test("missing environment variables produce a clear error without the API key", async (t) => {

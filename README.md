@@ -146,6 +146,20 @@ DSN 示例：`https://api1.unipile.com:13111`。
 DSN 不需要包含 `/api/v1`。
 DSN 未包含 `http://` 或 `https://` 时，插件自动补上 `https://`。
 插件会去掉 DSN 末尾的 `/`。
+DSN 仍可带原端口。
+你不需要修改现有 DSN 或 API Key 配置。
+DSN 带非协议默认端口时，插件自动通过 HTTPS 443 请求。
+请求 URL 不包含 `:端口号`。
+插件在每个请求中加入查询参数 `port=<原端口>`。
+例如：`https://api1.unipile.com/api/v1/accounts?port=13111`。
+插件保留其他查询参数。
+调用方传入的 `port` 会被 DSN 端口覆盖。
+DSN 无端口时，插件保留原协议。
+HTTPS DSN 使用 `:443` 时，插件不额外加入 `port`。
+HTTP DSN 使用 `:80` 时，插件不额外加入 `port`。
+443 请求失败时，插件返回错误。
+插件不回退到原端口。
+参见 [Unipile API 使用文档](https://developer.unipile.com/docs/api-usage)。
 
 ## 接入账号
 
@@ -232,7 +246,9 @@ bash scripts/run-mcp.sh
 MCP 客户端需要继承这两个环境变量。
 
 DSN 可能使用非常用端口，例如 `19891`。
-如果直连失败，请设置 `HTTPS_PROXY`。
+此时优先使用插件自动提供的 443 和 `port` 查询参数方式。
+现有代理逻辑仍可使用。
+需要代理时，请设置 `HTTPS_PROXY`。
 也可设置 `HTTP_PROXY`、`ALL_PROXY` 或 `SAND_EGRESS_TUNNEL_PROXY_ADDR`。
 代理地址必须包含 `http://` 或 `https://`。
 例如：`export HTTPS_PROXY='http://127.0.0.1:8080'`。
@@ -249,8 +265,10 @@ MCP 服务进程需要继承代理环境变量。
 规则支持主机名、域名后缀（例如 `.unipile.com`）和 `*`。
 主机名规则也匹配其子域名。
 `*` 表示所有目标都使用直连。
-主机名可带端口，例如 `api1.unipile.com:13111`。
+主机名可带端口，例如 `api1.unipile.com:443`。
 带端口的规则只匹配该端口。
+规则匹配实际请求 URL。
+DSN 非常用端口改写后，实际请求端口是 443。
 规则不区分大小写。
 命中规则时，插件不使用代理。
 
@@ -299,7 +317,9 @@ npm install --prefix server
 cd server && npm test
 ```
 
-测试使用本地 HTTP 服务。
+测试在 `fetch` 层拦截请求。
+测试检查每个工具请求的 443 地址和 `port` 查询参数。
+URL 单测覆盖默认端口、无协议 DSN 和查询参数合并。
 测试不调用真实的 Unipile 账号。
 stdio 测试会发送 `initialize` 和 `tools/list`。
 测试会确认服务正好提供七个工具。

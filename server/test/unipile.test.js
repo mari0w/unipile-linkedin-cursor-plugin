@@ -9,6 +9,7 @@ const before = "2026-10-10T00:00:00Z";
 const after = "2026-10-01T00:00:00Z";
 const emptyPage = { object: "List", items: [], cursor: null };
 const unsupportedAccount = { id: "other-account", type: "TELEGRAM", name: "其他账号" }; // 不支持 Telegram：测试拒绝非领英账号。
+const postRateReminder = "提醒：按 Unipile 保守建议，每个领英账号每天这类发帖操作建议不超过 100 次。发送间隔要随机。多个 bot 共用同一账号时额度共享。";
 const proxyEnvNames = [
   "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
   "ALL_PROXY", "all_proxy", "SAND_EGRESS_TUNNEL_PROXY_ADDR",
@@ -359,6 +360,7 @@ test("account tools reject unsupported accounts before any business request", as
     ["search_messages", { query: "need", chat_id: "chat-1" }],
     ["send_message", { chat_id: "chat-1", text: "hello", confirm: true }],
     ["start_chat_by_profile", { profile: "recipient-1", text: "hello", confirm: true }],
+    ["create_post", { text: "hello", confirm: true }],
     ["create_hosted_auth_link", {}],
   ]) {
     assert.deepEqual(await client.callTool({ name, arguments: { ...args, account_id } }), {
@@ -366,7 +368,7 @@ test("account tools reject unsupported accounts before any business request", as
       isError: true,
     });
   }
-  assert.equal(requests.length, 7);
+  assert.equal(requests.length, 8);
   for (const request of requests) assertRequest(request, `/api/v1/accounts/${account_id}`, {});
 });
 
@@ -380,6 +382,7 @@ test("message and chat tools require a nonempty account_id before any HTTP reque
     ["search_messages", { query: "need", chat_id: "chat-1" }],
     ["send_message", { chat_id: "chat-1", text: "hello", confirm: true }],
     ["start_chat_by_profile", { profile: "recipient-1", text: "hello", confirm: true }],
+    ["create_post", { text: "hello", confirm: true }],
   ]) {
     for (const account_id of [undefined, ""]) {
       const result = await client.callTool({ name, arguments: { ...args, account_id } });
@@ -571,6 +574,141 @@ test("start_chat_by_profile stops before POST when profile lookup fails or provi
   }
   assert.equal(requests.length, 8);
   assert.equal(requests.some(({ method }) => method === "POST"), false);
+});
+
+test("create_post previews only provided fields without confirm or with confirm=false and makes no requests", async (t) => {
+  const requests = await mockApi(t, undefined, unsupportedAccount);
+  const client = await connectClient(t);
+  delete process.env.UNIPILE_API_KEY;
+  delete process.env.UNIPILE_DSN;
+  const base = { account_id: "account-1", text: "你好，{{0}}。\nPlease confirm." };
+  const options = {
+    mentions: [{ name: "李明", profile_id: "profile-1" }],
+    external_link: "https://example.com/post",
+    repost: "post-1",
+    as_organization: "org-1",
+  };
+  for (const confirm of [undefined, false]) {
+    for (const preview of [base, { ...base, ...options }]) {
+      assert.deepEqual(await callTool(client, "create_post", { ...preview, confirm }), {
+        sent: false,
+        preview,
+        notice: "该动态将以你本人（或所选公司主页）的领英身份发出。确认后用 confirm=true 再次调用。",
+        rate_reminder: postRateReminder,
+      });
+    }
+  }
+  assert.equal(requests.length, 0);
+});
+
+test("create_post confirms LinkedIn first then posts only account_id and text as multipart", async (t) => {
+  const sent = { object: "PostCreated", post_id: "post-1" };
+  const requests = await mockApi(t, () => ({ status: 201, body: JSON.stringify(sent) }));
+  const client = await connectClient(t);
+  const account_id = "account/a ?#% 中文";
+  const text = "你好，领英。\nLinkedIn & text=保持原样";
+  assert.deepEqual(await callTool(client, "create_post", { account_id, text, confirm: true }), {
+    ...sent, rate_reminder: postRateReminder,
+  });
+  assert.equal(requests.length, 2);
+  assertRequest(requests[0], `/api/v1/accounts/${encodeURIComponent(account_id)}`, {});
+  const { contentType, body, ...request } = requests[1];
+  assert.deepEqual(request, {
+    method: "POST", path: "/api/v1/posts", query: { port: "13111" }, apiKey: "test-key", accept: "application/json",
+  });
+  assert.match(contentType, /^multipart\/form-data; boundary=.+$/);
+  const form = await new Response(body, { headers: { "content-type": contentType } }).formData();
+  assert.deepEqual([...form.entries()], [
+    ["account_id", account_id], ["text", text.replace(/\r?\n/g, "\r\n")],
+  ]);
+});
+
+test("create_post sends mentions as one JSON string and all optional multipart fields", async (t) => {
+  const sent = { object: "PostCreated", post_id: "post-2" };
+  const requests = await mockApi(t, () => sent);
+  const client = await connectClient(t);
+  const args = {
+    account_id: "account-1",
+    text: "你好，{{0}}、{{1}} 和 {{2}}。",
+    mentions: [
+      { name: "李明", profile_id: "profile-1" },
+      { name: "Alice", profile_id: "profile-2", is_company: false },
+      { name: "Example", profile_id: "company-1", is_company: true },
+    ],
+    external_link: "http://example.com/post?x=1&y=2",
+    repost: "existing-post-1",
+    as_organization: "org-1",
+  };
+  assert.deepEqual(await callTool(client, "create_post", { ...args, confirm: true }), {
+    ...sent, rate_reminder: postRateReminder,
+  });
+  assert.equal(requests.length, 2);
+  assertRequest(requests[0], "/api/v1/accounts/account-1", {});
+  const { contentType, body, ...request } = requests[1];
+  assert.deepEqual(request, {
+    method: "POST", path: "/api/v1/posts", query: { port: "13111" }, apiKey: "test-key", accept: "application/json",
+  });
+  assert.match(contentType, /^multipart\/form-data; boundary=.+$/);
+  const form = await new Response(body, { headers: { "content-type": contentType } }).formData();
+  assert.deepEqual([...form.entries()], Object.entries({ ...args, mentions: JSON.stringify(args.mentions) }));
+  assert.deepEqual(JSON.parse(form.get("mentions")), args.mentions);
+});
+
+test("create_post allows pure repost with required empty text and preserves an empty mentions array", async (t) => {
+  const sent = { object: "PostCreated", post_id: "reposted-1" };
+  const requests = await mockApi(t, () => sent);
+  const client = await connectClient(t);
+  const args = { account_id: "account-1", text: "", repost: "existing-post-1", mentions: [] };
+  const preview = await callTool(client, "create_post", args);
+  assert.deepEqual(preview.preview, args);
+  assert.equal(requests.length, 0);
+  assert.deepEqual(await callTool(client, "create_post", { ...args, confirm: true }), {
+    ...sent, rate_reminder: postRateReminder,
+  });
+  assert.equal(requests.length, 2);
+  assertRequest(requests[0], "/api/v1/accounts/account-1", {});
+  assert.equal(requests[1].path, "/api/v1/posts");
+  assert.equal(requests[1].method, "POST");
+  const form = await new Response(requests[1].body, {
+    headers: { "content-type": requests[1].contentType },
+  }).formData();
+  assert.deepEqual(Object.fromEntries(form), { ...args, mentions: "[]" });
+});
+
+test("create_post rejects missing or invalid inputs without any requests", async (t) => {
+  const requests = await mockApi(t);
+  const client = await connectClient(t);
+  for (const args of [
+    { account_id: undefined }, { account_id: "" }, { account_id: 123 },
+    { text: undefined }, { text: null }, { text: 123 },
+    { confirm: "true" }, { confirm: 1 },
+    { external_link: "" }, { external_link: "ftp://example.com" },
+    { external_link: "example.com" }, { external_link: 123 },
+    { repost: 123 }, { as_organization: 123 },
+    { mentions: {} }, { mentions: [null] },
+    { mentions: [{ name: "Alice" }] }, { mentions: [{ profile_id: "profile-1" }] },
+    { mentions: [{ name: 123, profile_id: "profile-1" }] },
+    { mentions: [{ name: "Alice", profile_id: 123 }] },
+    { mentions: [{ name: "Alice", profile_id: "profile-1", is_company: "false" }] },
+  ]) {
+    const result = await client.callTool({ name: "create_post", arguments: {
+      account_id: "account-1", text: "hello", confirm: true, ...args,
+    } });
+    assert.equal(result.isError, true, JSON.stringify(args));
+  }
+  assert.equal(requests.length, 0);
+});
+
+test("create_post does not POST when account lookup fails", async (t) => {
+  const requests = await mockApi(t, undefined, { status: 404, body: "Account not found" });
+  const client = await connectClient(t);
+  const result = await client.callTool({ name: "create_post", arguments: {
+    account_id: "missing-account", text: "hello", confirm: true,
+  } });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /Unipile HTTP 404/);
+  assert.equal(requests.length, 1);
+  assertRequest(requests[0], "/api/v1/accounts/missing-account", {});
 });
 
 test("create_hosted_auth_link fixes providers to LinkedIn and posts normalized api_url and UTC expiration", async (t) => {
@@ -1007,6 +1145,7 @@ test("all handlers return isError and continue to handle later requests", async 
     ["search_messages", { query: "need", account_id: "account-1" }],
     ["send_message", { chat_id: "chat-1", text: "hello", account_id: "account-1", confirm: true }],
     ["start_chat_by_profile", { profile: "recipient-1", text: "hello", account_id: "account-1", confirm: true }],
+    ["create_post", { text: "hello", account_id: "account-1", confirm: true }],
     ["create_hosted_auth_link", {}],
   ]) {
     const result = await client.callTool({ name, arguments: args });

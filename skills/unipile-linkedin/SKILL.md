@@ -6,6 +6,7 @@ description: >-
   通过 Unipile 读取多个领英账号的消息。
   用于汇总消息、收集需求和搜索正文。
   可用领英个人主页链接发起新对话。
+  可用 create_post 发布领英动态。
   优先使用 unipile-linkedin MCP 工具。
   发送前必须获得用户确认。
   批量发送前先读频率准则并提醒用户。
@@ -165,6 +166,29 @@ description: >-
 说明这可能触发了领英限制。
 稍后再试。
 不要连续重试。
+
+## 发领英动态：`create_post`
+
+1. 先不带 `confirm` 调用 `create_post` 获取预览。
+2. 传入 `account_id` 和 `text`。
+3. 把发送账号、动态全文和所选参数展示给用户。
+4. 说明动态会以用户本人的领英账号发出。提供 `as_organization` 时，以所选公司主页发出。
+5. 用户明确同意后，才用同一参数和 `confirm=true` 发布。
+
+默认预览不发送任何请求。
+确认后先校验领英账号，再发布动态。
+可选参数为 `mentions`、`external_link`、`repost` 和 `as_organization`。
+`mentions` 每项包含 `name`、`profile_id` 和可选的 `is_company`。
+在 `text` 中用 `{{0}}` 等索引对应 `mentions` 数组。
+`external_link` 必须以 `http://` 或 `https://` 开头。
+无评论转发时，传入 `repost` 和 `text: ""`。
+空文本只用于无评论转发。
+本版不支持附件。
+按 Unipile 保守建议，每个领英账号每天发帖建议不超过约 100 次。
+发送间隔要随机。
+多个 bot 共用同一账号时额度共享。
+向用户展示工具返回的 `rate_reminder`。
+工具不实施硬限流。
 
 ## 接入账号
 

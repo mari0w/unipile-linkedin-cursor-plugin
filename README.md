@@ -3,10 +3,11 @@
 ## 简介
 
 本插件通过 Unipile 在 Cursor / Grok Bot 读取领英（LinkedIn）消息。
+你也可以用 `create_post` 发领英动态。
 本插件只支持领英账号。
 本插件不支持 Telegram 或其他平台。
 本插件最多接入 10 个领英账号。
-本插件以读取为主，另有两个发送工具。
+本插件以读取为主，另有两个消息发送工具和一个动态发布工具。
 你可以用它汇总消息。
 你也可以用它收集需求。
 你也可以用它生成账号接入链接。
@@ -22,6 +23,7 @@
 | `search_messages` | 分页读取领英消息，在本地匹配正文关键字 | 有 `chat_id` 时使用 `GET /api/v1/chats/{chat_id}/messages`；否则使用 `GET /api/v1/messages` |
 | `send_message` | 默认返回预览，用户确认后发送领英文本消息 | `POST /api/v1/chats/{chat_id}/messages` |
 | `start_chat_by_profile` | 用个人主页链接或公开 ID 发起对话。默认只预览。确认后发送。不做 InMail | `GET /api/v1/users/{identifier}`，再用 `POST /api/v1/chats` |
+| `create_post` | 默认返回预览，用户确认后发布领英动态 | `POST /api/v1/posts` |
 | `create_hosted_auth_link` | 生成领英账号接入或重连链接，新建受 10 个账号上限限制 | `POST /api/v1/hosted/accounts/link` |
 
 所有工具只支持领英账号。
@@ -127,6 +129,30 @@ Unipile 用它阻止在其他账号的对话中发送。
 工具最后用表单发送 `attendees_ids`、`text` 和 `account_id`。
 工具不设置 `linkedin[inmail]`。
 参见 [创建对话接口](https://developer.unipile.com/reference/chatscontroller_startnewchat)。
+
+## 发领英动态
+
+用 `create_post` 发布领英动态。
+`account_id` 和 `text` 必填。
+动态以你本人的领英账号发出。
+提供 `as_organization` 时，以所选公司主页发出。
+`confirm` 默认为 `false`。
+默认只返回预览，不发送任何请求。
+助手先展示账号、动态全文和所选参数。
+你明确确认后，助手才用同一参数和 `confirm=true` 发布。
+工具先校验领英账号，再用 multipart/form-data 调用发帖接口。
+
+- `mentions`：提及数组。每项包含 `name`、`profile_id` 和可选的 `is_company`。在 `text` 中用 `{{0}}` 对应第一项，用 `{{1}}` 对应第二项。
+- `external_link`：外部链接。必须以 `http://` 或 `https://` 开头。
+- `repost`：要转发的现有领英动态 ID。无评论转发时，`text` 必须为 `""`。空文本只用于无评论转发。
+- `as_organization`：你有权限管理的公司主页 ID。
+
+本版不支持附件。
+按 Unipile 保守建议，每个领英账号每天发帖建议不超过约 100 次。
+发送间隔要随机。
+多个 bot 共用同一账号时额度共享。
+工具返回 `rate_reminder` 提醒，不实施硬限流。
+参见 [创建动态接口](https://developer.unipile.com/reference/postscontroller_createpost)。
 
 ## 前提
 
@@ -380,7 +406,7 @@ cd server && npm test
 URL 单测覆盖默认端口、无协议 DSN 和查询参数合并。
 测试不调用真实的 Unipile 账号。
 stdio 测试会发送 `initialize` 和 `tools/list`。
-测试会确认服务正好提供七个工具。
+测试会确认服务正好提供八个工具。
 
 ## 许可证
 

@@ -1,7 +1,7 @@
 {
   "name": "unipile-linkedin-mcp-server",
   "version": "1.0.0",
-  "description": "Unipile MCP server for LinkedIn accounts, messages, confirmed sending, and hosted authentication",
+  "description": "Unipile MCP server for LinkedIn accounts, messages, confirmed sending and posting, and hosted authentication",
   "main": "./index.js",
   "type": "module",
   "scripts": {

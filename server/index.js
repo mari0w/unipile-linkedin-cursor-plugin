@@ -55,6 +55,22 @@ export function baseUrl(dsn) {
   return /^https?:\/\//i.test(value) ? value : `https://${value}`;
 }
 
+export function buildUnipileUrl(dsn, path, query = {}) {
+  const base = baseUrl(dsn);
+  const { hostname, port } = new URL(base);
+  // URL.port is empty for protocol default ports.
+  const origin = port ? `https://${hostname}` : base;
+  const url = new URL(`${origin}/api/v1${path}`);
+  const params = new URLSearchParams();
+  for (const [name, value] of Object.entries(query)) {
+    if (value !== undefined) params.set(name, String(value));
+  }
+  // Use the DSN port on every request through standard 443.
+  if (port) params.set("port", port);
+  url.search = params.toString();
+  return url;
+}
+
 function errorMessage(error, apiKey = process.env.UNIPILE_API_KEY?.trim()) {
   const message = error instanceof Error ? error.message : String(error);
   return apiKey ? message.split(apiKey).join("[REDACTED]") : message;
@@ -70,12 +86,7 @@ export async function unipileRequest(path, { method = "GET", query = {}, body } 
   }
 
   try {
-    const url = new URL(`${baseUrl(dsn)}/api/v1${path}`);
-    const params = new URLSearchParams();
-    for (const [name, value] of Object.entries(query)) {
-      if (value !== undefined) params.set(name, String(value));
-    }
-    url.search = params.toString();
+    const url = buildUnipileUrl(dsn, path, query);
     const headers = { "X-API-KEY": apiKey, accept: "application/json" };
     if (body !== undefined && !(body instanceof FormData)) {
       headers["content-type"] = "application/json";

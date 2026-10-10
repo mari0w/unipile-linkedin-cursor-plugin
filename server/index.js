@@ -3,9 +3,35 @@ import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { ProxyAgent } from "undici";
 import { z } from "zod";
 
 const MAX_LINKEDIN_ACCOUNTS = 10;
+let cachedProxyUrl = null;
+let proxyDispatcher = null;
+
+export function resolveProxyUrl(env = process.env) {
+  for (const name of [
+    "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+    "ALL_PROXY", "all_proxy", "SAND_EGRESS_TUNNEL_PROXY_ADDR",
+  ]) {
+    const value = env[name]?.trim();
+    if (value) return value;
+  }
+  return null;
+}
+
+export function getProxyDispatcher() {
+  const proxyUrl = resolveProxyUrl();
+  if (proxyUrl !== cachedProxyUrl) {
+    const nextDispatcher = proxyUrl ? new ProxyAgent(proxyUrl) : null;
+    // Drain the old agent without blocking requests that use the new setting.
+    proxyDispatcher?.close().catch(() => {});
+    proxyDispatcher = nextDispatcher;
+    cachedProxyUrl = proxyUrl;
+  }
+  return proxyDispatcher;
+}
 
 export function baseUrl(dsn) {
   const value = dsn.trim().replace(/\/+$/, "").replace(/\/api\/v1$/i, "");
@@ -38,11 +64,13 @@ export async function unipileRequest(path, { method = "GET", query = {}, body } 
       headers["content-type"] = "application/json";
       body = JSON.stringify(body);
     }
+    const dispatcher = getProxyDispatcher();
     const response = await fetch(url, {
       method,
       headers,
       body,
       signal: AbortSignal.timeout(30000),
+      ...(dispatcher ? { dispatcher } : {}),
     });
     if (!response.ok) {
       const body = errorMessage(await response.text(), apiKey).slice(0, 500);

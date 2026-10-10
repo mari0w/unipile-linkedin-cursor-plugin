@@ -3,14 +3,33 @@ import { createServer as createHttpServer } from "node:http";
 import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { baseUrl, createServer, searchMessages, unipileRequest } from "../index.js";
+import { ProxyAgent } from "undici";
+import { baseUrl, createServer, getProxyDispatcher, resolveProxyUrl, searchMessages, unipileRequest } from "../index.js";
 
 const before = "2026-10-10T00:00:00Z";
 const after = "2026-10-01T00:00:00Z";
 const emptyPage = { object: "List", items: [], cursor: null };
 const unsupportedAccount = { id: "other-account", type: "TELEGRAM", name: "其他账号" }; // 不支持 Telegram：测试拒绝非领英账号。
+const proxyEnvNames = [
+  "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+  "ALL_PROXY", "all_proxy", "SAND_EGRESS_TUNNEL_PROXY_ADDR",
+];
+
+function clearProxyEnv(t) {
+  const previous = Object.fromEntries(proxyEnvNames.map((name) => [name, process.env[name]]));
+  for (const name of proxyEnvNames) delete process.env[name];
+  getProxyDispatcher();
+  t.after(() => {
+    for (const name of proxyEnvNames) delete process.env[name];
+    getProxyDispatcher();
+    for (const [name, value] of Object.entries(previous)) {
+      if (value !== undefined) process.env[name] = value;
+    }
+  });
+}
 
 async function mockApi(t, respond = () => emptyPage, account = { type: "LINKEDIN" }) {
+  clearProxyEnv(t);
   const previousKey = process.env.UNIPILE_API_KEY;
   const previousDsn = process.env.UNIPILE_DSN;
   const requests = [];
@@ -530,6 +549,87 @@ test("baseUrl adds https and removes trailing slashes and the API suffix", () =>
   assert.equal(baseUrl(" https://api1.unipile.com:13111/// "), "https://api1.unipile.com:13111");
   assert.equal(baseUrl("http://127.0.0.1:1234/"), "http://127.0.0.1:1234");
   assert.equal(baseUrl("https://api1.unipile.com:13111/api/v1///"), "https://api1.unipile.com:13111");
+});
+
+test("resolveProxyUrl skips blank values and selects every proxy variable in priority order", () => {
+  assert.equal(resolveProxyUrl({}), null);
+  assert.equal(resolveProxyUrl(Object.fromEntries(proxyEnvNames.map((name) => [name, " \t "]))), null);
+  const env = Object.fromEntries(proxyEnvNames.map((name, index) => [name, ` http://proxy-${index}.example:8080 \n`]));
+  for (let index = 0; index < proxyEnvNames.length; index++) {
+    assert.equal(resolveProxyUrl(env), `http://proxy-${index}.example:8080`, proxyEnvNames[index]);
+    env[proxyEnvNames[index]] = " \t ";
+  }
+  assert.equal(resolveProxyUrl(env), null);
+});
+
+test("unipileRequest uses direct fetch when no proxy is set", async (t) => {
+  const requests = await mockApi(t);
+  const directFetch = globalThis.fetch;
+  t.mock.method(globalThis, "fetch", (url, options) => {
+    assert.equal(Object.hasOwn(options, "dispatcher"), false);
+    return directFetch(url, options);
+  });
+  assert.deepEqual(await unipileRequest("/accounts"), emptyPage);
+  assertRequest(requests[0], "/api/v1/accounts", {});
+});
+
+test("unipileRequest passes a shared ProxyAgent to concurrent requests and updates proxy settings", async (t) => {
+  const requests = await mockApi(t);
+  process.env.HTTPS_PROXY = " https://proxy.example:8443 ";
+  process.env.HTTP_PROXY = "http://fallback.example:8080";
+  const dispatchers = [];
+  t.mock.method(globalThis, "fetch", async (url, options) => {
+    assert.equal(url.pathname, "/api/v1/accounts");
+    assert.ok(options.dispatcher instanceof ProxyAgent);
+    assert.equal(options.headers["X-API-KEY"], "test-key");
+    assert.ok(options.signal instanceof AbortSignal);
+    dispatchers.push(options.dispatcher);
+    return Response.json(emptyPage);
+  });
+  assert.equal(resolveProxyUrl(), "https://proxy.example:8443");
+  assert.deepEqual(await Promise.all([unipileRequest("/accounts"), unipileRequest("/accounts")]), [emptyPage, emptyPage]);
+  assert.equal(dispatchers[0], dispatchers[1]);
+  const oldClose = t.mock.method(dispatchers[0], "close");
+  delete process.env.HTTPS_PROXY;
+  await unipileRequest("/accounts");
+  assert.equal(resolveProxyUrl(), "http://fallback.example:8080");
+  assert.notEqual(dispatchers[2], dispatchers[0]);
+  assert.ok(oldClose.mock.callCount() > 0);
+  await oldClose.mock.calls[0].result;
+  assert.equal(dispatchers[0].closed, true);
+  delete process.env.HTTP_PROXY;
+  assert.equal(getProxyDispatcher(), null);
+  assert.equal(requests.length, 0);
+});
+
+test("unipileRequest uses lowercase HTTPS and tunnel proxies without a network connection", async (t) => {
+  const requests = await mockApi(t);
+  t.mock.method(globalThis, "fetch", async (_url, options) => {
+    assert.ok(options.dispatcher instanceof ProxyAgent);
+    return Response.json(emptyPage);
+  });
+  for (const name of ["https_proxy", "SAND_EGRESS_TUNNEL_PROXY_ADDR"]) {
+    process.env[name] = " http://proxy.example:8080 ";
+    assert.equal(resolveProxyUrl(), "http://proxy.example:8080");
+    assert.deepEqual(await unipileRequest("/accounts"), emptyPage);
+    delete process.env[name];
+  }
+  assert.equal(requests.length, 0);
+});
+
+test("invalid proxy settings and proxy fetch failures allow later requests", async (t) => {
+  const requests = await mockApi(t);
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => {
+    throw new Error("Proxy failure for test-key");
+  });
+  process.env.HTTPS_PROXY = "not a proxy URL";
+  await assert.rejects(unipileRequest("/accounts"), { message: "Invalid URL" });
+  assert.equal(fetchMock.mock.callCount(), 0);
+  process.env.HTTPS_PROXY = "http://proxy.example:8080";
+  await assert.rejects(unipileRequest("/accounts"), { message: "Proxy failure for [REDACTED]" });
+  fetchMock.mock.mockImplementation(async () => Response.json(emptyPage));
+  assert.deepEqual(await unipileRequest("/accounts"), emptyPage);
+  assert.equal(requests.length, 0);
 });
 
 test("unipileRequest reads environment variables on each call", async (t) => {

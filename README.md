@@ -204,6 +204,18 @@ bash scripts/run-mcp.sh
 脚本通过 stdio 提供 MCP 服务。
 MCP 客户端需要继承这两个环境变量。
 
+DSN 可能使用非常用端口，例如 `19891`。
+如果直连失败，请设置 `HTTPS_PROXY`。
+也可设置 `HTTP_PROXY`、`ALL_PROXY` 或 `SAND_EGRESS_TUNNEL_PROXY_ADDR`。
+代理地址必须包含 `http://` 或 `https://`。
+例如：`export HTTPS_PROXY='http://127.0.0.1:8080'`。
+MCP 服务进程需要继承代理环境变量。
+插件按上述顺序选择第一个非空代理地址。
+插件会去掉地址两端的空白。
+前三个变量也支持小写名称。
+同一变量优先使用大写名称。
+未设置代理地址时，插件使用直连。
+
 ## 使用示例提问
 
 - “列出我在 Unipile 接入的领英账号。”

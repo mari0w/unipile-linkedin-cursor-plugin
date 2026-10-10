@@ -352,21 +352,28 @@ export function createServer() {
       text: z.string().describe("动态全文。空字符串只用于无评论转发，此时须提供 repost。"),
       confirm: z.boolean().default(false),
       mentions: z.array(z.object({
-        name: z.string(),
-        profile_id: z.string(),
+        name: z.string().min(1),
+        profile_id: z.string().min(1),
         is_company: z.boolean().optional(),
       })).optional(),
       external_link: z.string().regex(/^https?:\/\//).optional(),
-      repost: z.string().optional(),
-      as_organization: z.string().optional(),
+      repost: z.string().min(1).optional(),
+      as_organization: z.string().min(1).optional(),
     },
     async ({ account_id, text, confirm, ...options }) => {
       try {
+        if (text === "" && !options.repost) {
+          throw new Error("空 text 只用于无评论转发。请提供 repost，或填写 text。");
+        }
         if (confirm !== true) {
+          let notice = "该动态将以你本人（或所选公司主页）的领英身份发出。确认后用 confirm=true 再次调用。";
+          if (options.external_link && !text.includes(options.external_link)) {
+            notice += "若正文未包含 external_link，Unipile 会把该链接自动加到正文末尾。";
+          }
           return textResult({
             sent: false,
             preview: { account_id, text, ...options },
-            notice: "该动态将以你本人（或所选公司主页）的领英身份发出。确认后用 confirm=true 再次调用。",
+            notice,
             rate_reminder: POST_RATE_REMINDER,
           });
         }

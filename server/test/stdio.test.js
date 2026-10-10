@@ -70,6 +70,12 @@ test("stdio initialize and tools/list expose exactly eight tools", { timeout: 10
   assert.deepEqual(createPost.inputSchema.required, ["account_id", "text"]);
   assert.equal(createPost.inputSchema.properties.text.type, "string");
   assert.equal(createPost.inputSchema.properties.text.minLength, undefined);
+  for (const name of ["repost", "as_organization"]) {
+    assert.equal(createPost.inputSchema.properties[name].minLength, 1);
+  }
+  for (const name of ["name", "profile_id"]) {
+    assert.equal(createPost.inputSchema.properties.mentions.items.properties[name].minLength, 1);
+  }
   assert.deepEqual(Object.keys(createPost.inputSchema.properties).sort(), [
     "account_id", "as_organization", "confirm", "external_link", "mentions", "repost", "text",
   ]);

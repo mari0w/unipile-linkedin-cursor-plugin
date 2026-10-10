@@ -179,10 +179,15 @@ description: >-
 确认后先校验领英账号，再发布动态。
 可选参数为 `mentions`、`external_link`、`repost` 和 `as_organization`。
 `mentions` 每项包含 `name`、`profile_id` 和可选的 `is_company`。
+`name` 和 `profile_id` 不能是空字符串。
 在 `text` 中用 `{{0}}` 等索引对应 `mentions` 数组。
 `external_link` 必须以 `http://` 或 `https://` 开头。
+若正文未包含 `external_link`，Unipile 会把该链接自动加到正文末尾。
+此时把预览的 `notice` 提示展示给用户。
+`repost` 和 `as_organization` 不能是空字符串。
 无评论转发时，传入 `repost` 和 `text: ""`。
 空文本只用于无评论转发。
+`text` 为空时，必须提供非空的 `repost`。
 本版不支持附件。
 按 Unipile 保守建议，每个领英账号每天发帖建议不超过约 100 次。
 发送间隔要随机。

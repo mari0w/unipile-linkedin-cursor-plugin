@@ -147,6 +147,13 @@ Unipile 用它阻止在其他账号的对话中发送。
 - `repost`：要转发的现有领英动态 ID。无评论转发时，`text` 必须为 `""`。空文本只用于无评论转发。
 - `as_organization`：你有权限管理的公司主页 ID。
 
+`repost` 和 `as_organization` 不能是空字符串。
+每项提及的 `name` 和 `profile_id` 也不能是空字符串。
+`text` 为空时，必须提供非空的 `repost`。
+这些校验在预览和请求前完成。
+若正文未包含 `external_link`，Unipile 会把该链接自动加到正文末尾。
+此时预览的 `notice` 会提示你。
+
 本版不支持附件。
 按 Unipile 保守建议，每个领英账号每天发帖建议不超过约 100 次。
 发送间隔要随机。

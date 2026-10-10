@@ -593,12 +593,67 @@ test("create_post previews only provided fields without confirm or with confirm=
       assert.deepEqual(await callTool(client, "create_post", { ...preview, confirm }), {
         sent: false,
         preview,
-        notice: "该动态将以你本人（或所选公司主页）的领英身份发出。确认后用 confirm=true 再次调用。",
+        notice: "该动态将以你本人（或所选公司主页）的领英身份发出。确认后用 confirm=true 再次调用。"
+          + (preview.external_link ? "若正文未包含 external_link，Unipile 会把该链接自动加到正文末尾。" : ""),
         rate_reminder: postRateReminder,
       });
     }
   }
   assert.equal(requests.length, 0);
+});
+
+test("create_post rejects empty IDs and mention fields before preview or confirmation without requests", async (t) => {
+  const requests = await mockApi(t);
+  const client = await connectClient(t);
+  for (const confirm of [undefined, false, true]) {
+    for (const [field, options] of [
+      ["repost", { repost: "" }],
+      ["as_organization", { as_organization: "" }],
+      ["name", { mentions: [{ name: "", profile_id: "profile-1" }] }],
+      ["profile_id", { mentions: [{ name: "Alice", profile_id: "" }] }],
+    ]) {
+      const result = await client.callTool({ name: "create_post", arguments: {
+        account_id: "account-1", text: "hello", confirm, ...options,
+      } });
+      assert.equal(result.isError, true, JSON.stringify({ confirm, options }));
+      assert.ok(result.content[0].text.includes(field), result.content[0].text);
+      assert.equal(requests.length, 0);
+    }
+  }
+});
+
+test("create_post rejects empty text without a repost before preview or confirmation without requests", async (t) => {
+  const requests = await mockApi(t);
+  const client = await connectClient(t);
+  for (const confirm of [undefined, false, true]) {
+    const result = await client.callTool({ name: "create_post", arguments: {
+      account_id: "account-1", text: "", confirm,
+    } });
+    assert.equal(result.isError, true);
+    assert.equal(result.content[0].text, "Error: 空 text 只用于无评论转发。请提供 repost，或填写 text。");
+    assert.equal(requests.length, 0);
+  }
+});
+
+test("create_post warns only when external_link is absent from preview text without requests", async (t) => {
+  const requests = await mockApi(t);
+  const client = await connectClient(t);
+  const external_link = "https://example.com/post?x=1&y=2";
+  const warning = "若正文未包含 external_link，Unipile 会把该链接自动加到正文末尾。";
+  for (const confirm of [undefined, false]) {
+    for (const [text, warns] of [
+      ["你好，领英。", true],
+      ["https://example.com/post", true],
+      ["", true],
+      [`你好，领英。\n${external_link}\n请查看。`, false],
+    ]) {
+      const args = { account_id: "account-1", text, external_link, ...(text === "" ? { repost: "post-1" } : {}) };
+      const result = await callTool(client, "create_post", { ...args, confirm });
+      assert.deepEqual(result.preview, args);
+      assert.equal(result.notice.includes(warning), warns);
+      assert.equal(requests.length, 0);
+    }
+  }
 });
 
 test("create_post confirms LinkedIn first then posts only account_id and text as multipart", async (t) => {

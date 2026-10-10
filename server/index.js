@@ -3,9 +3,52 @@ import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { ProxyAgent } from "undici";
 import { z } from "zod";
 
 const MAX_LINKEDIN_ACCOUNTS = 10;
+let cachedProxyUrl = null;
+let proxyDispatcher = null;
+
+export function resolveProxyUrl(env = process.env) {
+  for (const name of [
+    "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+    "ALL_PROXY", "all_proxy", "SAND_EGRESS_TUNNEL_PROXY_ADDR",
+  ]) {
+    const value = env[name]?.trim();
+    if (value) return value;
+  }
+  return null;
+}
+
+export function shouldBypassProxy(destination, env = process.env) {
+  const bypassList = env.NO_PROXY?.trim() || env.no_proxy?.trim() || "";
+  const url = new URL(destination);
+  const host = url.hostname.toLowerCase();
+  const port = url.port || (url.protocol === "https:" ? "443" : "80");
+  return bypassList.split(",").some((entry) => {
+    const rule = entry.trim().toLowerCase();
+    if (rule === "*") return true;
+    // Optional port, including bracketed IPv6 hosts.
+    const match = /^(\[[^\]]+\]|[^:]+)(?::(\d+))?$/.exec(rule);
+    if (!match || (match[2] && match[2] !== port)) return false;
+    const domain = match[1].replace(/^\*?\./, "");
+    return host === domain || host.endsWith(`.${domain}`);
+  });
+}
+
+export function getProxyDispatcher(destination) {
+  if (destination && shouldBypassProxy(destination)) return null;
+  const proxyUrl = resolveProxyUrl();
+  if (proxyUrl !== cachedProxyUrl) {
+    const nextDispatcher = proxyUrl ? new ProxyAgent(proxyUrl) : null;
+    // Drain the old agent without blocking requests that use the new setting.
+    proxyDispatcher?.close().catch(() => {});
+    proxyDispatcher = nextDispatcher;
+    cachedProxyUrl = proxyUrl;
+  }
+  return proxyDispatcher;
+}
 
 export function baseUrl(dsn) {
   const value = dsn.trim().replace(/\/+$/, "").replace(/\/api\/v1$/i, "");
@@ -38,11 +81,13 @@ export async function unipileRequest(path, { method = "GET", query = {}, body } 
       headers["content-type"] = "application/json";
       body = JSON.stringify(body);
     }
+    const dispatcher = getProxyDispatcher(url);
     const response = await fetch(url, {
       method,
       headers,
       body,
       signal: AbortSignal.timeout(30000),
+      ...(dispatcher ? { dispatcher } : {}),
     });
     if (!response.ok) {
       const body = errorMessage(await response.text(), apiKey).slice(0, 500);
@@ -58,6 +103,21 @@ const limit = z.number().int().min(1).max(250).optional();
 const utcTime = z.string().datetime().optional();
 const maxPages = z.number().int().min(1).max(10).default(3);
 const accountId = z.string().min(1).describe("领英账号 ID。来自 list_accounts 的 account_id。");
+
+export function parseLinkedinPublicId(profile) {
+  const invalid = () => new Error("profile 无效。请输入 linkedin.com/in/{slug} 个人主页链接或公开 ID（slug）。");
+  if (typeof profile !== "string") throw invalid();
+  const value = profile.trim();
+  const match = /^(?:https?:\/\/)?(?:www\.)?linkedin\.com\/in\/([^/?#]+)\/?(?:[?#].*)?$/i.exec(value);
+  let publicId;
+  try {
+    publicId = decodeURIComponent(match ? match[1] : value);
+  } catch {
+    throw invalid();
+  }
+  if (!/^[\p{L}\p{N}\p{M}_-]+$/u.test(publicId)) throw invalid();
+  return publicId;
+}
 
 async function requireLinkedin(account_id) {
   const account = await unipileRequest(`/accounts/${encodeURIComponent(account_id)}`);
@@ -225,8 +285,43 @@ export function createServer() {
   );
 
   server.tool(
+    "start_chat_by_profile",
+    "只支持领英账号。不支持其他平台。用个人主页链接或公开 ID（slug）发起对话并发送文本。account_id 必填，来自 list_accounts。消息以用户本人领英身份发出。非 Connections（非好友）可能失败。本工具不做 InMail。默认只返回预览。预览不发送任何请求。发送前必须向用户展示收件人的公开 ID、所选账号和消息全文。用户明确确认后才传 confirm=true。只有 confirm=true 才请求。先查询账号类型，再查询收件人的 provider_id，最后创建对话并发送消息。",
+    {
+      profile: z.string().min(1),
+      text: z.string().min(1),
+      account_id: accountId,
+      confirm: z.boolean().default(false),
+    },
+    async ({ profile, text, account_id, confirm }) => {
+      try {
+        const public_id = parseLinkedinPublicId(profile);
+        if (confirm !== true) {
+          return textResult({
+            sent: false,
+            preview: { public_id, account_id, text },
+            notice: "消息将以你本人的领英身份发出。非好友可能发不出去。本工具不做 InMail。确认后用 confirm=true 再次调用。",
+          });
+        }
+        await requireLinkedin(account_id);
+        const user = await unipileRequest(`/users/${encodeURIComponent(public_id)}`, { query: { account_id } });
+        if (typeof user.provider_id !== "string" || !user.provider_id.trim()) {
+          throw new Error("收件人查询未返回有效的 provider_id。未发送消息。");
+        }
+        const body = new FormData();
+        body.set("attendees_ids", user.provider_id);
+        body.set("text", text);
+        body.set("account_id", account_id);
+        return textResult(await unipileRequest("/chats", { method: "POST", body }));
+      } catch (error) {
+        return errorResult(error);
+      }
+    }
+  );
+
+  server.tool(
     "create_hosted_auth_link",
-    "只支持领英账号。不支持其他平台。生成领英账号的临时接入链接。新建时 providers 固定为 [\"LINKEDIN\"]。最多接入 10 个领英账号。新建前分页统计全部领英账号。达到上限时工具报错。重新接入时传 account_id，其值来自 list_accounts。重连前先查询账号类型。重连不检查账号数量。expires_in_minutes 默认为 60。范围为 1 到 1440。把链接给本人在浏览器打开完成登录。链接不要公开分享。所有链接在 Unipile 每日重启时失效。",
+    "只支持领英账号。不支持其他平台。生成领英账号的临时接入链接。新建时 providers 固定为 [\"LINKEDIN\"]。最多接入 10 个领英账号。新建前分页统计全部领英账号。达到上限时工具报错。重新接入时传 account_id，其值来自 list_accounts。重连前先查询账号类型。重连不检查账号数量。expires_in_minutes 默认为 60。范围为 1 到 1440。把返回的 url 作为可点击链接发给用户。用户可直接在浏览器打开此链接完成领英登录。链接不要公开分享。所有链接在 Unipile 每日重启时失效。",
     {
       account_id: accountId.optional(),
       expires_in_minutes: z.number().int().min(1).max(1440).default(60),

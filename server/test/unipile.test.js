@@ -3,14 +3,34 @@ import { createServer as createHttpServer } from "node:http";
 import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { baseUrl, createServer, searchMessages, unipileRequest } from "../index.js";
+import { ProxyAgent } from "undici";
+import { baseUrl, createServer, getProxyDispatcher, parseLinkedinPublicId, resolveProxyUrl, searchMessages, shouldBypassProxy, unipileRequest } from "../index.js";
 
 const before = "2026-10-10T00:00:00Z";
 const after = "2026-10-01T00:00:00Z";
 const emptyPage = { object: "List", items: [], cursor: null };
 const unsupportedAccount = { id: "other-account", type: "TELEGRAM", name: "其他账号" }; // 不支持 Telegram：测试拒绝非领英账号。
+const proxyEnvNames = [
+  "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+  "ALL_PROXY", "all_proxy", "SAND_EGRESS_TUNNEL_PROXY_ADDR",
+];
+const allProxyEnvNames = [...proxyEnvNames, "NO_PROXY", "no_proxy"];
+
+function clearProxyEnv(t) {
+  const previous = Object.fromEntries(allProxyEnvNames.map((name) => [name, process.env[name]]));
+  for (const name of allProxyEnvNames) delete process.env[name];
+  getProxyDispatcher();
+  t.after(() => {
+    for (const name of allProxyEnvNames) delete process.env[name];
+    getProxyDispatcher();
+    for (const [name, value] of Object.entries(previous)) {
+      if (value !== undefined) process.env[name] = value;
+    }
+  });
+}
 
 async function mockApi(t, respond = () => emptyPage, account = { type: "LINKEDIN" }) {
+  clearProxyEnv(t);
   const previousKey = process.env.UNIPILE_API_KEY;
   const previousDsn = process.env.UNIPILE_DSN;
   const requests = [];
@@ -327,6 +347,7 @@ test("account tools reject unsupported accounts before any business request", as
     ["search_messages", { query: "need" }],
     ["search_messages", { query: "need", chat_id: "chat-1" }],
     ["send_message", { chat_id: "chat-1", text: "hello", confirm: true }],
+    ["start_chat_by_profile", { profile: "recipient-1", text: "hello", confirm: true }],
     ["create_hosted_auth_link", {}],
   ]) {
     assert.deepEqual(await client.callTool({ name, arguments: { ...args, account_id } }), {
@@ -334,7 +355,7 @@ test("account tools reject unsupported accounts before any business request", as
       isError: true,
     });
   }
-  assert.equal(requests.length, 6);
+  assert.equal(requests.length, 7);
   for (const request of requests) assertRequest(request, `/api/v1/accounts/${account_id}`, {});
 });
 
@@ -347,6 +368,7 @@ test("message and chat tools require a nonempty account_id before any HTTP reque
     ["search_messages", { query: "need" }],
     ["search_messages", { query: "need", chat_id: "chat-1" }],
     ["send_message", { chat_id: "chat-1", text: "hello", confirm: true }],
+    ["start_chat_by_profile", { profile: "recipient-1", text: "hello", confirm: true }],
   ]) {
     for (const account_id of [undefined, ""]) {
       const result = await client.callTool({ name, arguments: { ...args, account_id } });
@@ -402,6 +424,106 @@ test("send_message rejects empty text and nonboolean confirm without requests", 
     assert.equal(result.isError, true);
   }
   assert.equal(requests.length, 0);
+});
+
+test("parseLinkedinPublicId accepts profile URLs and bare public IDs", () => {
+  for (const [profile, expected] of [
+    ["alice-smith-123", "alice-smith-123"],
+    ["  alice-smith-123  ", "alice-smith-123"],
+    ["https://www.linkedin.com/in/alice-smith-123", "alice-smith-123"],
+    ["https://linkedin.com/in/alice-smith-123/?trk=profile#about", "alice-smith-123"],
+    ["http://www.linkedin.com/in/alice-smith-123/", "alice-smith-123"],
+    ["www.linkedin.com/in/alice-smith-123?trk=profile", "alice-smith-123"],
+    ["linkedin.com/in/alice-smith-123/", "alice-smith-123"],
+    ["HTTPS://WWW.LINKEDIN.COM/in/Alice-123", "Alice-123"],
+    ["https://linkedin.com/in/%E6%9D%8E%E6%98%8E-123", "李明-123"],
+  ]) assert.equal(parseLinkedinPublicId(profile), expected, profile);
+});
+
+test("parseLinkedinPublicId rejects invalid hosts, paths, slugs and escapes", () => {
+  for (const profile of [
+    undefined, null, 123, "", "   ", "alice smith", "alice/extra", "alice?trk=profile",
+    "https://example.com/in/alice", "https://linkedin.com.evil.example/in/alice",
+    "https://www.linkedin.com/company/alice", "https://linkedin.com/in/",
+    "https://linkedin.com/in/alice/extra", "ftp://linkedin.com/in/alice",
+    "https://user@linkedin.com/in/alice", "https://linkedin.com/in/%2Fsecret",
+    "https://linkedin.com/in/%ZZ", "https://linkedin.com/in/../alice",
+  ]) assert.throws(() => parseLinkedinPublicId(profile), /profile 无效/);
+});
+
+test("start_chat_by_profile previews without confirm or with confirm=false without requests", async (t) => {
+  const requests = await mockApi(t, undefined, unsupportedAccount);
+  const client = await connectClient(t);
+  delete process.env.UNIPILE_API_KEY;
+  delete process.env.UNIPILE_DSN;
+  const args = { profile: "https://www.linkedin.com/in/recipient-1/?trk=profile", account_id: "account-1", text: "你好。\nPlease confirm." };
+  for (const confirm of [undefined, false]) {
+    const result = await callTool(client, "start_chat_by_profile", { ...args, confirm });
+    assert.equal(result.sent, false);
+    assert.deepEqual(result.preview, { public_id: "recipient-1", account_id: args.account_id, text: args.text });
+    assert.match(result.notice, /你本人的领英身份/);
+    assert.match(result.notice, /非好友可能发不出去/);
+    assert.match(result.notice, /本工具不做 InMail/);
+    assert.match(result.notice, /confirm=true/);
+  }
+  assert.equal(requests.length, 0);
+});
+
+test("start_chat_by_profile confirms account, retrieves provider_id, then posts only the three multipart fields", async (t) => {
+  const sent = { object: "ChatStarted", chat_id: "chat-1", message_id: "message-1" };
+  const provider_id = "ACo-provider-123";
+  const requests = await mockApi(t, ({ path }) => path.startsWith("/api/v1/users/")
+    ? { provider_id } : { status: 201, body: JSON.stringify(sent) });
+  const client = await connectClient(t);
+  const account_id = "account & 中文";
+  const text = "你好，领英。\nLinkedIn & text=保持原样";
+  assert.deepEqual(await callTool(client, "start_chat_by_profile", {
+    profile: "https://linkedin.com/in/%E6%9D%8E%E6%98%8E-123/", text, account_id, confirm: true,
+  }), sent);
+  assert.equal(requests.length, 3);
+  assertRequest(requests[0], `/api/v1/accounts/${encodeURIComponent(account_id)}`, {});
+  assertRequest(requests[1], `/api/v1/users/${encodeURIComponent("李明-123")}`, { account_id });
+  const { contentType, body, ...request } = requests[2];
+  assert.deepEqual(request, {
+    method: "POST", path: "/api/v1/chats", query: {}, apiKey: "test-key", accept: "application/json",
+  });
+  assert.match(contentType, /^multipart\/form-data; boundary=.+$/);
+  const form = await new Response(body, { headers: { "content-type": contentType } }).formData();
+  assert.deepEqual([...form.entries()], [
+    ["attendees_ids", provider_id], ["text", text.replace(/\r?\n/g, "\r\n")], ["account_id", account_id],
+  ]);
+});
+
+test("start_chat_by_profile rejects invalid input before requests", async (t) => {
+  const requests = await mockApi(t);
+  const client = await connectClient(t);
+  for (const args of [
+    { profile: "https://example.com/in/alice", confirm: true },
+    { profile: "https://linkedin.com/in/" },
+    { text: "" }, { confirm: "true" },
+  ]) {
+    const result = await client.callTool({ name: "start_chat_by_profile", arguments: {
+      profile: "recipient-1", text: "hello", account_id: "account-1", ...args,
+    } });
+    assert.equal(result.isError, true);
+    if (args.profile) assert.match(result.content[0].text, /profile 无效/);
+  }
+  assert.equal(requests.length, 0);
+});
+
+test("start_chat_by_profile stops before POST when profile lookup fails or provider_id is missing", async (t) => {
+  let response;
+  const requests = await mockApi(t, () => response);
+  const client = await connectClient(t);
+  for (response of [{}, { provider_id: " " }, { provider_id: 123 }, { status: 404, body: "Not found" }]) {
+    const result = await client.callTool({ name: "start_chat_by_profile", arguments: {
+      profile: "recipient-1", text: "hello", account_id: "account-1", confirm: true,
+    } });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /provider_id|Unipile HTTP 404/);
+  }
+  assert.equal(requests.length, 8);
+  assert.equal(requests.some(({ method }) => method === "POST"), false);
 });
 
 test("create_hosted_auth_link fixes providers to LinkedIn and posts normalized api_url and UTC expiration", async (t) => {
@@ -532,6 +654,133 @@ test("baseUrl adds https and removes trailing slashes and the API suffix", () =>
   assert.equal(baseUrl("https://api1.unipile.com:13111/api/v1///"), "https://api1.unipile.com:13111");
 });
 
+test("resolveProxyUrl skips blank values and selects every proxy variable in priority order", () => {
+  assert.equal(resolveProxyUrl({}), null);
+  assert.equal(resolveProxyUrl(Object.fromEntries(proxyEnvNames.map((name) => [name, " \t "]))), null);
+  const env = Object.fromEntries(proxyEnvNames.map((name, index) => [name, ` http://proxy-${index}.example:8080 \n`]));
+  for (let index = 0; index < proxyEnvNames.length; index++) {
+    assert.equal(resolveProxyUrl(env), `http://proxy-${index}.example:8080`, proxyEnvNames[index]);
+    env[proxyEnvNames[index]] = " \t ";
+  }
+  assert.equal(resolveProxyUrl(env), null);
+});
+
+test("NO_PROXY matches hosts and suffixes at domain boundaries, wildcard and optional ports", () => {
+  for (const [destination, rule, expected] of [
+    ["https://api.unipile.com:13111", " other.example, API.UNIPILE.COM ", true],
+    ["https://api.unipile.com", "api.unipile.com", true],
+    ["https://api.unipile.com", ".unipile.com", true],
+    ["https://unipile.com", ".unipile.com", true],
+    ["https://api.unipile.com", "unipile.com", true],
+    ["https://api.unipile.com", "*.unipile.com", true],
+    ["https://evilunipile.com", ".unipile.com", false],
+    ["https://api.unipile.com.evil.example", ".unipile.com", false],
+    ["https://api.unipile.com", "other.example", false],
+    ["https://api.unipile.com", "", false],
+    ["https://api.unipile.com", " * ", true],
+    ["https://api.unipile.com:13111", "api.unipile.com:13111", true],
+    ["https://api.unipile.com:13111", "api.unipile.com:443", false],
+    ["https://api.unipile.com", "api.unipile.com:443", true],
+    ["http://127.0.0.1", "127.0.0.1:80", true],
+    ["http://[::1]:1234", "[::1]:1234", true],
+  ]) assert.equal(shouldBypassProxy(destination, { NO_PROXY: rule }), expected, `${destination}: ${rule}`);
+  assert.equal(shouldBypassProxy("https://api.unipile.com", { no_proxy: ".unipile.com" }), true);
+  assert.equal(shouldBypassProxy("https://api.unipile.com", { NO_PROXY: " ", no_proxy: "*" }), true);
+  assert.equal(shouldBypassProxy("https://api.unipile.com", { NO_PROXY: "other.example", no_proxy: "*" }), false);
+});
+
+test("unipileRequest bypasses ProxyAgent for matching NO_PROXY and no_proxy on each call", async (t) => {
+  const requests = await mockApi(t);
+  // Bypass must happen before ProxyAgent construction, even for a bad proxy URL.
+  process.env.HTTPS_PROXY = "not a proxy URL";
+  const directFetch = globalThis.fetch;
+  t.mock.method(globalThis, "fetch", (url, options) => {
+    assert.equal(Object.hasOwn(options, "dispatcher"), false);
+    return directFetch(url, options);
+  });
+  process.env.NO_PROXY = "other.example, 127.0.0.1";
+  assert.deepEqual(await unipileRequest("/accounts"), emptyPage);
+  process.env.NO_PROXY = " ";
+  process.env.no_proxy = "127.0.0.1";
+  assert.deepEqual(await unipileRequest("/accounts"), emptyPage);
+  process.env.no_proxy = "*";
+  assert.deepEqual(await unipileRequest("/accounts"), emptyPage);
+  assert.equal(requests.length, 3);
+  process.env.no_proxy = "other.example";
+  await assert.rejects(unipileRequest("/accounts"), { message: "Invalid URL" });
+  assert.equal(requests.length, 3);
+});
+
+test("unipileRequest uses direct fetch when no proxy is set", async (t) => {
+  const requests = await mockApi(t);
+  const directFetch = globalThis.fetch;
+  t.mock.method(globalThis, "fetch", (url, options) => {
+    assert.equal(Object.hasOwn(options, "dispatcher"), false);
+    return directFetch(url, options);
+  });
+  assert.deepEqual(await unipileRequest("/accounts"), emptyPage);
+  assertRequest(requests[0], "/api/v1/accounts", {});
+});
+
+test("unipileRequest passes a shared ProxyAgent to concurrent requests and updates proxy settings", async (t) => {
+  const requests = await mockApi(t);
+  process.env.HTTPS_PROXY = " https://proxy.example:8443 ";
+  process.env.HTTP_PROXY = "http://fallback.example:8080";
+  const dispatchers = [];
+  t.mock.method(globalThis, "fetch", async (url, options) => {
+    assert.equal(url.pathname, "/api/v1/accounts");
+    assert.ok(options.dispatcher instanceof ProxyAgent);
+    assert.equal(options.headers["X-API-KEY"], "test-key");
+    assert.ok(options.signal instanceof AbortSignal);
+    dispatchers.push(options.dispatcher);
+    return Response.json(emptyPage);
+  });
+  assert.equal(resolveProxyUrl(), "https://proxy.example:8443");
+  assert.deepEqual(await Promise.all([unipileRequest("/accounts"), unipileRequest("/accounts")]), [emptyPage, emptyPage]);
+  assert.equal(dispatchers[0], dispatchers[1]);
+  const oldClose = t.mock.method(dispatchers[0], "close");
+  delete process.env.HTTPS_PROXY;
+  await unipileRequest("/accounts");
+  assert.equal(resolveProxyUrl(), "http://fallback.example:8080");
+  assert.notEqual(dispatchers[2], dispatchers[0]);
+  assert.ok(oldClose.mock.callCount() > 0);
+  await oldClose.mock.calls[0].result;
+  assert.equal(dispatchers[0].closed, true);
+  delete process.env.HTTP_PROXY;
+  assert.equal(getProxyDispatcher(), null);
+  assert.equal(requests.length, 0);
+});
+
+test("unipileRequest uses lowercase HTTPS and tunnel proxies without a network connection", async (t) => {
+  const requests = await mockApi(t);
+  t.mock.method(globalThis, "fetch", async (_url, options) => {
+    assert.ok(options.dispatcher instanceof ProxyAgent);
+    return Response.json(emptyPage);
+  });
+  for (const name of ["https_proxy", "SAND_EGRESS_TUNNEL_PROXY_ADDR"]) {
+    process.env[name] = " http://proxy.example:8080 ";
+    assert.equal(resolveProxyUrl(), "http://proxy.example:8080");
+    assert.deepEqual(await unipileRequest("/accounts"), emptyPage);
+    delete process.env[name];
+  }
+  assert.equal(requests.length, 0);
+});
+
+test("invalid proxy settings and proxy fetch failures allow later requests", async (t) => {
+  const requests = await mockApi(t);
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => {
+    throw new Error("Proxy failure for test-key");
+  });
+  process.env.HTTPS_PROXY = "not a proxy URL";
+  await assert.rejects(unipileRequest("/accounts"), { message: "Invalid URL" });
+  assert.equal(fetchMock.mock.callCount(), 0);
+  process.env.HTTPS_PROXY = "http://proxy.example:8080";
+  await assert.rejects(unipileRequest("/accounts"), { message: "Proxy failure for [REDACTED]" });
+  fetchMock.mock.mockImplementation(async () => Response.json(emptyPage));
+  assert.deepEqual(await unipileRequest("/accounts"), emptyPage);
+  assert.equal(requests.length, 0);
+});
+
 test("unipileRequest reads environment variables on each call", async (t) => {
   const requests = await mockApi(t);
   await unipileRequest("/accounts", { query: { cursor: undefined, limit: undefined } });
@@ -590,6 +839,7 @@ test("all handlers return isError and continue to handle later requests", async 
     ["get_chat_messages", { chat_id: "chat-1", account_id: "account-1" }],
     ["search_messages", { query: "need", account_id: "account-1" }],
     ["send_message", { chat_id: "chat-1", text: "hello", account_id: "account-1", confirm: true }],
+    ["start_chat_by_profile", { profile: "recipient-1", text: "hello", account_id: "account-1", confirm: true }],
     ["create_hosted_auth_link", {}],
   ]) {
     const result = await client.callTool({ name, arguments: args });

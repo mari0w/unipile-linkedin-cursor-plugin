@@ -3,7 +3,7 @@ import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ProxyAgent } from "undici";
-import { baseUrl, buildUnipileUrl, createServer, getProxyDispatcher, parseLinkedinPublicId, resolveProxyUrl, searchMessages, shouldBypassProxy, unipileRequest } from "../index.js";
+import { baseUrl, buildUnipileUrl, createServer, getProxyDispatcher, parseLinkedinPublicId, resetProxyState, resolveProxyUrl, searchMessages, shouldBypassProxy, unipileRequest } from "../index.js";
 
 const before = "2026-10-10T00:00:00Z";
 const after = "2026-10-01T00:00:00Z";
@@ -30,10 +30,10 @@ function assertRateReminder(reminder) {
 function clearProxyEnv(t) {
   const previous = Object.fromEntries(allProxyEnvNames.map((name) => [name, process.env[name]]));
   for (const name of allProxyEnvNames) delete process.env[name];
-  getProxyDispatcher();
+  resetProxyState();
   t.after(() => {
     for (const name of allProxyEnvNames) delete process.env[name];
-    getProxyDispatcher();
+    resetProxyState();
     for (const [name, value] of Object.entries(previous)) {
       if (value !== undefined) process.env[name] = value;
     }
@@ -951,6 +951,16 @@ test("resolveProxyUrl skips blank values and selects every proxy variable in pri
   assert.equal(resolveProxyUrl(env), null);
 });
 
+test("resolveProxyUrl adds http to host:port and preserves existing schemes", () => {
+  for (const name of proxyEnvNames) {
+    assert.equal(resolveProxyUrl({ [name]: " proxy.example:8080 " }), "http://proxy.example:8080");
+    for (const scheme of ["http", "https", "socks", "socks5"]) {
+      const value = `${scheme}://proxy.example:8080`;
+      assert.equal(resolveProxyUrl({ [name]: value }), value);
+    }
+  }
+});
+
 test("NO_PROXY matches hosts and suffixes at domain boundaries, wildcard and optional ports", () => {
   for (const [destination, rule, expected] of [
     ["https://api.unipile.com:13111", " other.example, API.UNIPILE.COM ", true],
@@ -995,8 +1005,8 @@ test("unipileRequest bypasses ProxyAgent for matching NO_PROXY and no_proxy on e
   assert.deepEqual(await unipileRequest("/accounts"), emptyPage);
   assert.equal(requests.length, 4);
   process.env.no_proxy = "api1.unipile.com:13111";
-  await assert.rejects(unipileRequest("/accounts"), { message: "Invalid URL" });
-  assert.equal(requests.length, 4);
+  assert.deepEqual(await unipileRequest("/accounts"), emptyPage);
+  assert.equal(requests.length, 5);
 });
 
 test("unipileRequest uses direct fetch when no proxy is set", async (t) => {
@@ -1054,7 +1064,7 @@ test("unipileRequest uses lowercase HTTPS and tunnel proxies without a network c
     return Response.json(emptyPage);
   });
   for (const name of ["https_proxy", "SAND_EGRESS_TUNNEL_PROXY_ADDR"]) {
-    process.env[name] = " http://proxy.example:8080 ";
+    process.env[name] = " proxy.example:8080 ";
     assert.equal(resolveProxyUrl(), "http://proxy.example:8080");
     assert.deepEqual(await unipileRequest("/accounts"), emptyPage);
     delete process.env[name];
@@ -1062,19 +1072,156 @@ test("unipileRequest uses lowercase HTTPS and tunnel proxies without a network c
   assert.equal(requests.length, 0);
 });
 
-test("invalid proxy settings and proxy fetch failures allow later requests", async (t) => {
+test("invalid proxy settings fall back direct and failed retries allow later proxy requests", async (t) => {
   const requests = await mockApi(t);
   const fetchMock = t.mock.method(globalThis, "fetch", async () => {
     throw new Error("Proxy failure for test-key");
   });
   process.env.HTTPS_PROXY = "not a proxy URL";
-  await assert.rejects(unipileRequest("/accounts"), { message: "Invalid URL" });
-  assert.equal(fetchMock.mock.callCount(), 0);
+  await assert.rejects(unipileRequest("/accounts"), { message: "Proxy failure for [REDACTED]" });
+  assert.equal(fetchMock.mock.callCount(), 1);
   process.env.HTTPS_PROXY = "http://proxy.example:8080";
   await assert.rejects(unipileRequest("/accounts"), { message: "Proxy failure for [REDACTED]" });
   fetchMock.mock.mockImplementation(async () => Response.json(emptyPage));
   assert.deepEqual(await unipileRequest("/accounts"), emptyPage);
   assert.equal(requests.length, 0);
+});
+
+test("GET and HEAD proxy failures retry direct and later requests stay direct", async (t) => {
+  await mockApi(t);
+  process.env.HTTPS_PROXY = "proxy.example:8080";
+  for (const method of ["GET", "HEAD"]) {
+    resetProxyState();
+    const proxied = [];
+    t.mock.method(globalThis, "fetch", async (_url, options) => {
+      proxied.push(Object.hasOwn(options, "dispatcher"));
+      if (options.dispatcher) {
+        assert.ok(options.dispatcher instanceof ProxyAgent);
+        throw new Error("fetch failed");
+      }
+      return options.method === "HEAD" ? new Response(null) : Response.json(emptyPage);
+    });
+    assert.deepEqual(await unipileRequest("/accounts", { method }), method === "HEAD" ? "" : emptyPage);
+    assert.equal(getProxyDispatcher(), null);
+    assert.deepEqual(await unipileRequest("/accounts"), emptyPage);
+    await unipileRequest("/posts", { method: "POST", body: { text: "hello" } });
+    assert.deepEqual(proxied, [true, false, false, false]);
+  }
+});
+
+test("proxy timeout and connection errors match names, messages and causes", async (t) => {
+  await mockApi(t);
+  process.env.HTTPS_PROXY = "http://proxy.example:8080";
+  const errors = [
+    new DOMException("aborted", "AbortError"),
+    new DOMException("expired", "TimeoutError"),
+    ...["timeout", "ETIMEDOUT", "ECONNREFUSED", "ECONNRESET", "ENOTFOUND",
+      "EAI_AGAIN", "EHOSTUNREACH", "ENETUNREACH", "socket", "fetch failed"].map((message) => new Error(message)),
+    new Error("transport failed", { cause: new Error("ECONNRESET") }),
+    new Error("transport failed", { cause: { code: "EAI_AGAIN" } }),
+  ];
+  for (const error of errors) {
+    resetProxyState();
+    const fetchMock = t.mock.method(globalThis, "fetch", async (_url, options) => {
+      if (options.dispatcher) throw error;
+      return Response.json(emptyPage);
+    });
+    assert.deepEqual(await unipileRequest("/accounts"), emptyPage);
+    assert.equal(fetchMock.mock.callCount(), 2);
+  }
+});
+
+test("POST, PUT, PATCH and DELETE proxy failures are redacted without a retry", async (t) => {
+  await mockApi(t);
+  process.env.HTTPS_PROXY = "http://proxy.example:8080";
+  const fetchMock = t.mock.method(globalThis, "fetch", async (_url, options) => {
+    assert.ok(options.dispatcher instanceof ProxyAgent);
+    throw new Error("fetch failed for test-key");
+  });
+  for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
+    const calls = fetchMock.mock.callCount();
+    await assert.rejects(unipileRequest("/posts", { method, body: { text: "hello" } }), {
+      message: "fetch failed for [REDACTED]",
+    });
+    assert.equal(fetchMock.mock.callCount(), calls + 1);
+    assert.ok(getProxyDispatcher() instanceof ProxyAgent);
+  }
+  process.env.HTTPS_PROXY = "not a proxy URL";
+  const calls = fetchMock.mock.callCount();
+  await assert.rejects(unipileRequest("/posts", { method: "POST" }), { message: "Invalid URL" });
+  assert.equal(fetchMock.mock.callCount(), calls);
+});
+
+test("proxy HTTP errors never trigger direct retries, even if the error body fails", async (t) => {
+  await mockApi(t);
+  process.env.HTTPS_PROXY = "http://proxy.example:8080";
+  for (const status of [400, 502]) {
+    const fetchMock = t.mock.method(globalThis, "fetch", async () => new Response("fetch failed", { status }));
+    await assert.rejects(unipileRequest("/accounts"), { message: `Unipile HTTP ${status}: fetch failed` });
+    assert.equal(fetchMock.mock.callCount(), 1);
+  }
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => ({
+    ok: false, status: 502,
+    text: async () => { throw new Error("socket closed"); },
+  }));
+  await assert.rejects(unipileRequest("/accounts"), { message: "socket closed" });
+  assert.equal(fetchMock.mock.callCount(), 1);
+  assert.ok(getProxyDispatcher() instanceof ProxyAgent);
+});
+
+test("failed direct json or text reads keep the proxy preference", async (t) => {
+  await mockApi(t);
+  process.env.HTTPS_PROXY = "http://proxy.example:8080";
+  for (const method of ["GET", "HEAD"]) {
+    resetProxyState();
+    const proxied = [];
+    t.mock.method(globalThis, "fetch", async (_url, options) => {
+      proxied.push(Object.hasOwn(options, "dispatcher"));
+      if (proxied.length > 2) return Response.json(emptyPage);
+      if (options.dispatcher) throw new Error("fetch failed");
+      return {
+        ok: true,
+        [method === "HEAD" ? "text" : "json"]: async () => {
+          assert.ok(getProxyDispatcher() instanceof ProxyAgent);
+          throw new Error("socket closed for test-key");
+        },
+      };
+    });
+    await assert.rejects(unipileRequest("/accounts", { method }), { message: "socket closed for [REDACTED]" });
+    assert.ok(getProxyDispatcher() instanceof ProxyAgent);
+    assert.deepEqual(await unipileRequest("/accounts"), emptyPage);
+    assert.deepEqual(proxied, [true, false, true]);
+  }
+});
+
+test("a proxy response body network failure retries direct", async (t) => {
+  await mockApi(t);
+  process.env.HTTPS_PROXY = "http://proxy.example:8080";
+  const proxied = [];
+  t.mock.method(globalThis, "fetch", async (_url, options) => {
+    proxied.push(Object.hasOwn(options, "dispatcher"));
+    return options.dispatcher ? {
+      ok: true, json: async () => { throw new Error("socket closed"); },
+    } : Response.json(emptyPage);
+  });
+  assert.deepEqual(await unipileRequest("/accounts"), emptyPage);
+  assert.deepEqual(proxied, [true, false]);
+  assert.equal(getProxyDispatcher(), null);
+});
+
+test("invalid proxy URLs and unsupported ProxyAgent schemes retry reads direct", async (t) => {
+  await mockApi(t);
+  for (const proxy of ["not a proxy URL", "socks5://proxy.example:8080"]) {
+    resetProxyState();
+    process.env.HTTPS_PROXY = proxy;
+    const fetchMock = t.mock.method(globalThis, "fetch", async (_url, options) => {
+      assert.equal(Object.hasOwn(options, "dispatcher"), false);
+      return Response.json(emptyPage);
+    });
+    assert.deepEqual(await unipileRequest("/accounts"), emptyPage);
+    assert.equal(fetchMock.mock.callCount(), 1);
+    assert.equal(getProxyDispatcher(), null);
+  }
 });
 
 test("unipileRequest reads environment variables on each call", async (t) => {

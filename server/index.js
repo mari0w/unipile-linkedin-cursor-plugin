@@ -11,6 +11,14 @@ const RATE_REMINDER = "提醒：按 Unipile 保守建议，每个领英账号给
 const POST_RATE_REMINDER = "提醒：按 Unipile 保守建议，每个领英账号每天这类发帖操作建议不超过 100 次。发送间隔要随机。多个 bot 共用同一账号时额度共享。";
 let cachedProxyUrl = null;
 let proxyDispatcher = null;
+let preferDirect = false;
+
+export function resetProxyState() {
+  preferDirect = false;
+  proxyDispatcher?.close().catch(() => {});
+  proxyDispatcher = null;
+  cachedProxyUrl = null;
+}
 
 export function resolveProxyUrl(env = process.env) {
   for (const name of [
@@ -18,7 +26,7 @@ export function resolveProxyUrl(env = process.env) {
     "ALL_PROXY", "all_proxy", "SAND_EGRESS_TUNNEL_PROXY_ADDR",
   ]) {
     const value = env[name]?.trim();
-    if (value) return value;
+    if (value) return value.includes("://") ? value : `http://${value}`;
   }
   return null;
 }
@@ -40,6 +48,7 @@ export function shouldBypassProxy(destination, env = process.env) {
 }
 
 export function getProxyDispatcher(destination) {
+  if (preferDirect) return null;
   if (destination && shouldBypassProxy(destination)) return null;
   const proxyUrl = resolveProxyUrl();
   if (proxyUrl !== cachedProxyUrl) {
@@ -78,6 +87,14 @@ function errorMessage(error, apiKey = process.env.UNIPILE_API_KEY?.trim()) {
   return apiKey ? message.split(apiKey).join("[REDACTED]") : message;
 }
 
+function isConnectionError(error) {
+  return error && (
+    /^(AbortError|TimeoutError)$/.test(error.name) ||
+    /timeout|ETIMEDOUT|ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH|socket|fetch failed/i.test(`${error.message ?? error} ${error.code ?? ""}`) ||
+    isConnectionError(error.cause)
+  );
+}
+
 function rateLimitHint(status, bodyText) {
   if (status === 429 || status === 500 || (status === 422 && /cannot_resend_yet/i.test(bodyText))) {
     return " 停止发送。稍后再试。这可能触发了领英限制。";
@@ -101,20 +118,37 @@ export async function unipileRequest(path, { method = "GET", query = {}, body } 
       headers["content-type"] = "application/json";
       body = JSON.stringify(body);
     }
-    const dispatcher = getProxyDispatcher(url);
-    const response = await fetch(url, {
-      method,
-      headers,
-      body,
-      signal: AbortSignal.timeout(30000),
-      ...(dispatcher ? { dispatcher } : {}),
-    });
-    if (!response.ok) {
-      const bodyText = await response.text();
-      const body = errorMessage(bodyText, apiKey).slice(0, 500);
-      throw new Error(`Unipile HTTP ${response.status}: ${body}${rateLimitHint(response.status, bodyText)}`);
+    const useProxy = !preferDirect && resolveProxyUrl() && !shouldBypassProxy(url);
+    const readOnly = /^(GET|HEAD)$/i.test(method);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let proxySetupFailed = false;
+      let httpError = false;
+      try {
+        let dispatcher;
+        if (useProxy && attempt === 0) {
+          proxySetupFailed = true;
+          dispatcher = getProxyDispatcher(url);
+          proxySetupFailed = false;
+        }
+        const response = await fetch(url, {
+          method, headers, body,
+          signal: AbortSignal.timeout(30000),
+          ...(dispatcher ? { dispatcher } : {}),
+        });
+        if (!response.ok) {
+          httpError = true;
+          const bodyText = await response.text();
+          const body = errorMessage(bodyText, apiKey).slice(0, 500);
+          throw new Error(`Unipile HTTP ${response.status}: ${body}${rateLimitHint(response.status, bodyText)}`);
+        }
+        const result = await (/^HEAD$/i.test(method) ? response.text() : response.json());
+        if (attempt === 1) preferDirect = true;
+        return result;
+      } catch (error) {
+        if (attempt !== 0 || !useProxy || !readOnly || httpError ||
+            (!proxySetupFailed && !isConnectionError(error))) throw error;
+      }
     }
-    return await response.json();
   } catch (error) {
     throw new Error(errorMessage(error, apiKey));
   }
